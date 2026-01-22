@@ -423,7 +423,7 @@ class RollingOpsManager(Object):
     def _on_run_with_lock(self: CharmBase, event: RunWithLock):
         lock = Lock(self)
         if not lock.is_held(): # We are running after a defer
-            logger.info("RUNNING ON A DEFERRED")
+            logger.info(f"RUNNING ON A DEFERRED {event.callback_override}")
             self.charm.on[self.name].acquire_lock.emit(event.callback_override)
             return
 
@@ -433,6 +433,7 @@ class RollingOpsManager(Object):
         # default to instance callback if not set
         callback_name = event.callback_override or self._callback.__name__
         callback = getattr(self.charm, callback_name)
+        logger.info(f"RUNNING CALLBACK {event.callback_override}")
         callback(event)
 
         lock.release()  # Updates relation data
