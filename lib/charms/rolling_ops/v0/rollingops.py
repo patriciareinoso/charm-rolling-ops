@@ -262,7 +262,17 @@ class Locks:
 class RunWithLock(EventBase):
     """Event to signal that this unit should run the callback."""
 
-    pass
+    def __init__(self, handle, callback_override: Optional[str] = None):
+        super().__init__(handle)
+        self.callback_override = callback_override or ""
+
+    def snapshot(self):
+        """Snapshot of lock event."""
+        return {"callback_override": self.callback_override}
+
+    def restore(self, snapshot):
+        """Restores lock event."""
+        self.callback_override = snapshot["callback_override"]
 
 
 class AcquireLock(EventBase):
@@ -342,7 +352,11 @@ class RollingOpsManager(Object):
             self.model.unit.status = WaitingStatus("Awaiting {} operation".format(self.name))
 
         if lock.is_held():
-            self.charm.on[self.name].run_with_lock.emit()
+            relation = self.model.get_relation(self.name)
+            callback_name = relation.data[self.charm.unit].get(
+                "callback_override", self._callback.__name__
+            )
+            self.charm.on[self.name].run_with_lock.emit(callback_override=callback_name)
 
         if self.model.unit.is_leader():
             self.charm.on[self.name].process_locks.emit()
@@ -381,7 +395,11 @@ class RollingOpsManager(Object):
             lock.grant()
             if lock.unit == self.model.unit:
                 # It's time for the leader to run with lock.
-                self.charm.on[self.name].run_with_lock.emit()
+                relation = self.model.get_relation(self.name)
+                callback_name = relation.data[self.charm.unit].get(
+                    "callback_override", self._callback.__name__
+                )
+                self.charm.on[self.name].run_with_lock.emit(callback_override=callback_name)
             return
 
         if self.model.app.status.message == f"Beginning rolling {self.name}":
@@ -395,7 +413,7 @@ class RollingOpsManager(Object):
             relation = self.model.get_relation(self.name)
 
             # persist callback override for eventual run
-            relation.data[self.charm.unit].update({"callback_override": event.callback_override})
+            relation.data[self.charm.unit].update({"callback_override": event.callback_override}) # have a queque
             self.charm.on[self.name].relation_changed.emit(relation, app=self.charm.app)
 
         except LockNoRelationError:
@@ -404,13 +422,16 @@ class RollingOpsManager(Object):
 
     def _on_run_with_lock(self: CharmBase, event: RunWithLock):
         lock = Lock(self)
+        if not lock.is_held(): # We are running after a defer
+            logger.info("RUNNING ON A DEFERRED")
+            self.charm.on[self.name].acquire_lock.emit(event.callback_override)
+            return
+
         self.model.unit.status = MaintenanceStatus("Executing {} operation".format(self.name))
         relation = self.model.get_relation(self.name)
 
         # default to instance callback if not set
-        callback_name = relation.data[self.charm.unit].get(
-            "callback_override", self._callback.__name__
-        )
+        callback_name = event.callback_override or self._callback.__name__
         callback = getattr(self.charm, callback_name)
         callback(event)
 
