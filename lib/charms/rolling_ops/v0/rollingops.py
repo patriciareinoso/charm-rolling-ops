@@ -412,6 +412,10 @@ class RollingOpsManager(Object):
         """Request a lock."""
         try:
             lock = Lock(self)
+            if lock.release_requested():
+                logger.info(f"RUNNING ON A RELEASED {event.callback_override}")
+                event.defer()
+                return
             logger.info(lock._state)               
             lock.acquire()  # Updates relation data
             # emit relation changed event in the edge case where acquire does not
@@ -428,11 +432,6 @@ class RollingOpsManager(Object):
     def _on_run_with_lock(self: CharmBase, event: RunWithLock):
         lock = Lock(self)
         logger.info(lock._state)
-        
-        if lock.release_requested():
-            logger.info(f"RUNNING ON A RELEASED {event.callback_override}")
-            event.defer()
-            return
 
         if not lock.is_held(): # We are running after a defer
             logger.info(f"RUNNING ON A DEFERRED {event.callback_override}")
