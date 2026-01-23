@@ -182,7 +182,7 @@ class Lock:
             # Active acquire request.
             return LockState.ACQUIRE
 
-        logger.debug("Lock state: %s %s", unit_state, app_state)
+        logger.debug("Lock state: %s %s - %s", unit_state, app_state, self.unit)
         return app_state  # Granted or unset/released
 
     @_state.setter
@@ -347,8 +347,9 @@ class RollingOpsManager(Object):
         Then, if we are the leader, fire off a process locks event.
 
         """
+        
         lock = Lock(self)
-
+        logger.info(f"RECEIVEd RELATION CHANGE {self.model.unit} {lock._state}")
         if lock.is_pending():
             self.model.unit.status = WaitingStatus("Awaiting {} operation".format(self.name))
 
@@ -392,6 +393,8 @@ class RollingOpsManager(Object):
 
         # If we reach this point, and we have pending units, we want to grant a lock to
         # one of them.
+        pending_units = [lock.unit for lock in pending]
+        logger.info(f"PENDING: {pending_units}")
         if pending:
             self.model.app.status = MaintenanceStatus("Beginning rolling {}".format(self.name))
             lock = pending[-1]
@@ -411,6 +414,7 @@ class RollingOpsManager(Object):
     def _on_acquire_lock(self: CharmBase, event: ActionEvent):
         """Request a lock."""
         try:
+            logger.info(f"ACQUIRING LOCK FOR {self.model.unit}")
             lock = Lock(self)
             if lock.release_requested():
                 logger.info(f"RUNNING ON A RELEASED {event.callback_override}")
