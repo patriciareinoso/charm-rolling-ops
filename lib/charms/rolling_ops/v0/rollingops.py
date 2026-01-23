@@ -212,8 +212,9 @@ class Lock:
 
     def release(self):
         """Request that a lock be released."""
-        self._state = LockState.RELEASE
-        logger.debug("Lock released.")
+        self._state = LockState.RELEASE # makes it RELEASE / GRANTED
+        logger.debug("Lock released.") # so when we acquire in defer -> ACQUIRE / GRANTED
+        # it re executes before a the clear is executed
 
     def clear(self):
         """Unset a lock."""
@@ -373,6 +374,8 @@ class RollingOpsManager(Object):
         pending = []
 
         for lock in Locks(self):
+            
+            logger.info(f"PROCESSING: {lock._state}, {lock.unit}")
             if lock.is_held():
                 # One of our units has the lock -- return without further processing.
                 return
@@ -408,7 +411,9 @@ class RollingOpsManager(Object):
     def _on_acquire_lock(self: CharmBase, event: ActionEvent):
         """Request a lock."""
         try:
-            Lock(self).acquire()  # Updates relation data
+            lock = Lock(self)
+            logger.info(lock._state)
+            lock.acquire()  # Updates relation data
             # emit relation changed event in the edge case where acquire does not
             relation = self.model.get_relation(self.name)
 
@@ -422,6 +427,7 @@ class RollingOpsManager(Object):
 
     def _on_run_with_lock(self: CharmBase, event: RunWithLock):
         lock = Lock(self)
+        logger.info(lock._state)
         if not lock.is_held(): # We are running after a defer
             logger.info(f"RUNNING ON A DEFERRED {event.callback_override}")
             self.charm.on[self.name].acquire_lock.emit(event.callback_override)
