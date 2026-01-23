@@ -430,6 +430,7 @@ class RollingOpsManager(Object):
         logger.info(lock._state)
         
         if lock.release_requested():
+            logger.info(f"RUNNING ON A RELEASED {event.callback_override}")
             event.defer()
             return
 
