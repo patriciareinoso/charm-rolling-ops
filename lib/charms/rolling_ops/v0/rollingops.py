@@ -349,7 +349,7 @@ class RollingOpsManager(Object):
         self.framework.observe(charm.on[self.name].run_with_lock, self._on_run_with_lock)
         #self.framework.observe(charm.on[self.name].process_locks, self._on_process_locks)
         self.framework.observe(charm.on.leader_elected, self._on_process_locks)
-        self.framework.observe(charm.on.collect_status, self._on_collect_status)
+        #self.framework.observe(charm.on.collect_status, self._on_collect_status)
         self.framework.observe(charm.on.update_status, self._on_collect_status)
         
     def _on_collect_status(self, event):
