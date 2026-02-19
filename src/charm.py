@@ -18,9 +18,10 @@
 import logging
 import time
 
-from charms.rolling_ops.v0.rollingops import RollingOpsManager, DeferLock
+from charms.rolling_ops.v0.rollingops import RollingOpsManager, OperationResult
 from ops import ActiveStatus, CharmBase, main
 from ops.framework import StoredState
+from ops.charm import StopEvent
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +34,17 @@ class CharmRollingOpsCharm(CharmBase):
     def __init__(self, *args):
         super().__init__(*args)
 
+        callback_targets = {
+            "_restart" : self._restart,
+            "_custom_restart" : self._custom_restart
+        }
+
         self.restart_manager = RollingOpsManager(
-            charm=self, relation="restart", callback=self._restart
+            charm=self, relation="restart", callback_targets=callback_targets
         )
 
         self.framework.observe(self.on.install, self._on_install)
+        self.framework.observe(self.on.stop, self.on_stop)
         self.framework.observe(self.on.restart_action, self._on_restart_action)
         self.framework.observe(self.on.custom_restart_action, self._on_custom_restart_action)
 
@@ -45,7 +52,7 @@ class CharmRollingOpsCharm(CharmBase):
         self._stored.set_default(restarted=False)
         self._stored.set_default(delay=None)
 
-    def _restart(self, event):
+    def _restart(self):
         # In a production charm, we'd perhaps import the systemd library, and run
         # systemd.restart_service.  Here, we just set a sentinel in our stored state, so
         # that we can run our tests.
@@ -54,32 +61,38 @@ class CharmRollingOpsCharm(CharmBase):
             time.sleep(int(self._stored.delay))
         self._stored.restarted = True
 
-        self.model.get_relation(self.restart_manager.name).data[self.unit].update({
+        self.model.get_relation(self.restart_manager.relation_name).data[self.unit].update({
             "restart-type": "restart"
         })
         
 
-    def _custom_restart(self, event):
+    def _custom_restart(self):
         logger.info("RUNNING CUSTOM RESTART")
         if self._stored.delay:
             time.sleep(int(self._stored.delay))
 
-        self.model.get_relation(self.restart_manager.name).data[self.unit].update({
+        self.model.get_relation(self.restart_manager.relation_name).data[self.unit].update({
             "restart-type": "custom-restart"
         })
-        raise DeferLock()
+        return OperationResult.RETRY
 
     def _on_install(self, event):
         self.unit.status = ActiveStatus()
 
     def _on_restart_action(self, event):
         self._stored.delay = event.params.get("delay")
-        self.on[self.restart_manager.name].acquire_lock.emit()
+        self.on[self.restart_manager.relation_name].acquire_lock.emit(callback_id="_restart")
 
     def _on_custom_restart_action(self, event):
         self._stored.delay = event.params.get("delay")
-        self.on[self.restart_manager.name].acquire_lock.emit(callback_override="_custom_restart")
+        self.on[self.restart_manager.relation_name].acquire_lock.emit(callback_id="_custom_restart", max_retry=3)
 
+    def on_stop(self, event: StopEvent):
+        relation = self.model.get_relation("restart")
+        if relation:
+            logger.info(f"DATA: {relation.data}")
+        else:
+            logger.info(f"relatio not found")
 
 if __name__ == "__main__":
     main(CharmRollingOpsCharm)
