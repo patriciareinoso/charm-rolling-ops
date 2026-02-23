@@ -41,7 +41,6 @@ class CharmRollingOpsCharm(CharmBase):
         )
 
         self.framework.observe(self.on.install, self._on_install)
-        self.framework.observe(self.on.stop, self.on_stop)
         self.framework.observe(self.on.restart_action, self._on_restart_action)
         self.framework.observe(self.on.custom_restart_action, self._on_custom_restart_action)
 

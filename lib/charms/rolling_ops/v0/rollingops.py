@@ -24,9 +24,8 @@ Interface (peer relation):
 - Unit databag keys:
   - state: "idle" | "request" | "retry"
   - operations: JSON-encoded list of queued operations (FIFO)
-  - last_retry: timestamp string (UTC) of the most recent retry signal
   - attempt: integer (string) number of attempts for the head operation
-  - completed_at: timestamp string (UTC) when the head operation completed successfully
+  - executed_at: timestamp string (UTC) when the head operation completed successfully
 
 - App databag keys:
   - granted_unit: string "<unit-id>" or ""
@@ -41,7 +40,7 @@ Operation queue semantics:
 
 Retry semantics:
 - If a unit returns OperationResult.RETRY, it transitions to state="retry", increments attempt,
-  and records last_retry. The head operation remains queued.
+  and records executed_at. The head operation remains queued.
 - A max_retries value may be specified per operation. When exceeded, the head operation is
   dropped and the unit proceeds to attempt to acquire the lock for the next queued operation (if any).
 
@@ -49,7 +48,7 @@ Scheduling:
 - The leader grants the lock when no unit is currently granted.
 - Requests are preferred over retries.
 - Among requests, the oldest enqueued_at is selected.
-- Among retries, the oldest last_retry is selected.
+- Among retries, the oldest executed_at is selected.
 
 All timestamps are stored in UTC using TIMESTAMP_FORMAT.
 
@@ -141,12 +140,13 @@ def _now_timestamp() -> str:
     return datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT)
 
 
-def _parse_timestamp(timestamp: str) -> datetime:
+def _parse_timestamp(timestamp: str) -> Optional[datetime]:
     """Parse timestamp string. Return 'now' on errors to avoid selecting invalid timestamps."""
     try:
-        return datetime.strptime(timestamp, TIMESTAMP_FORMAT)
+        dt = datetime.strptime(timestamp, TIMESTAMP_FORMAT)
+        return dt.replace(tzinfo=timezone.utc)
     except Exception:
-        return datetime.now(timezone.utc)
+        return None
 
 
 def _args_to_json(data: dict[str, any]) -> str:
@@ -226,8 +226,6 @@ class OperationQueue:
 
     def __init__(self, operations: Optional[list[Operation]] = None):
         self.operations: list[Operation] = list(operations or [])
-
-    # ---- core queue operations ----
 
     def __len__(self) -> int:
         """Return the number of operations in the queue."""
@@ -344,7 +342,7 @@ class Lock:
             self.complete()
             return
         self.relation.data[self.unit].update({
-            "last_retry": _now_timestamp(),
+            "executed_at": _now_timestamp(),
             "state": LockIntent.RETRY.value,
         })
         self._increase_attempt()
@@ -360,10 +358,9 @@ class Lock:
 
         self.relation.data[self.unit].update({
             "state": next_state,
-            "last_retry": "",
             "attempt": "",
             "operations": queue.to_string(),
-            "completed_at": _now_timestamp(),
+            "executed_at": _now_timestamp(),
         })
 
     def release(self):
@@ -387,21 +384,12 @@ class Lock:
 
     def should_run(self) -> bool:
         """Return True if the lock has been granted to the unit and it is time to execute callback."""
-        if self.is_held() and self._grant_is_after_unit_completed():  # REQUEST - GRANTED
-            return True
-
-        if self.is_retry() and self._grant_is_after_unit_retry():  # RETRY - GRANTED
-            return True
+        return self.is_granted() and not self._unit_executed_after_grant()  # REQUEST - GRANTED
 
     def should_release(self) -> bool:
         """Return True if the unit finished executing the callback and should be released."""
-        if self.is_completed():  # IDLE - granted
-            return True
-        elif self.is_retry() and not self._grant_is_after_unit_retry():  # RETRY - granted
-            return True
-        elif self.is_held() and not self._grant_is_after_unit_completed():  # REQUEST - granted
-            return True
-        return False
+        logger.info(f"should_release {self.is_completed()} {self._unit_executed_after_grant()}")
+        return  self.is_completed() or self._unit_executed_after_grant()  # REQUEST - granted
 
     def is_held(self) -> bool:
         """Return True if the unit holds the lock."""
@@ -418,8 +406,7 @@ class Lock:
     def is_completed(self) -> bool:
         """Return True if this unit is completed callback but still has the grant (leader should clear)."""
         unit_intent = self.relation.data[self.unit].get("state")
-        granted_unit = self.relation.data[self.app].get("granted_unit", "")
-        return unit_intent == LockIntent.IDLE.value and granted_unit == str(self.unit)
+        return unit_intent == LockIntent.IDLE.value and self.is_granted()
 
     def is_retry(self) -> bool:
         """Return True if this unit requested retry but still has the grant (leader should clear)."""
@@ -460,9 +447,9 @@ class Lock:
         attempt = self.relation.data[self.unit].get("attempt", "")
         return attempt if attempt else 0
 
-    def get_last_retry(self) -> datetime | None:
+    def get_last_completed(self) -> datetime | None:
         """Get the time the unit requested a retry of the head operation."""
-        timestamp_str = self.relation.data[self.unit].get("last_retry", "")
+        timestamp_str = self.relation.data[self.unit].get("executed_at", "")
         if timestamp_str:
             return _parse_timestamp(timestamp_str)
         return None
@@ -474,34 +461,16 @@ class Lock:
             return None
         return _parse_timestamp(operation.requested_at)
 
-    def _grant_is_after_unit_retry(self) -> bool:
-        if not self.is_retry():
-            return True
+    def _unit_executed_after_grant(self) -> bool:
+        granted_at = _parse_timestamp(self.relation.data[self.app].get("granted_at", ""))
+        executed_at = _parse_timestamp(self.relation.data[self.unit].get("executed_at", ""))
 
-        grant_ts = _parse_timestamp(self.relation.data[self.app].get("granted_at", ""))
-        retry_ts = _parse_timestamp(self.relation.data[self.unit].get("last_retry", ""))
-
-        # If there was never a retry, treat grant as "after"
-        if grant_ts is None:
+        if granted_at is None:
             return False
-        if retry_ts is None:
-            return True
-
-        return grant_ts > retry_ts
-
-    def _grant_is_after_unit_completed(self) -> bool:
-        if not self.is_held():
-            return True
-
-        grant_ts = _parse_timestamp(self.relation.data[self.app].get("granted_at", ""))
-        completed_ts = _parse_timestamp(self.relation.data[self.unit].get("completed_at", ""))
-
-        if grant_ts is None:
+        if executed_at is None:
             return False
-        if completed_ts is None:
-            return True
-
-        return grant_ts > completed_ts
+        logger.info(f"_unit_executed_after_grant {  executed_at > granted_at}")
+        return  executed_at > granted_at
 
 
 class Locks:
@@ -546,13 +515,13 @@ class AcquireLock(EventBase):
         self.max_retry = snapshot["max_retry"]
 
 
-def pick_oldest_retry(locks: list[Lock]) -> Optional[Lock]:
-    """Choose the retry lock with the oldest last_retry timestamp."""
+def pick_oldest_completed(locks: list[Lock]) -> Optional[Lock]:
+    """Choose the retry lock with the oldest executed_at timestamp."""
     selected = None
     oldest_timestamp = None
 
     for lock in locks:
-        timestamp = lock.get_last_retry()
+        timestamp = lock.get_last_completed()
         if not timestamp:
             continue
 
@@ -654,7 +623,7 @@ class RollingOpsManager(Object):
         for lock in Locks(self):
             if lock.should_release():
                 lock.release()
-            break
+                break
 
         relation = self.model.get_relation(self.relation_name)
         granted_unit = relation.data[self.model.app].get("granted_unit", "")
@@ -690,7 +659,7 @@ class RollingOpsManager(Object):
         if pending_requests:
             selected = pick_oldest_request(pending_requests)
         elif pending_retries:
-            selected = pick_oldest_retry(pending_retries)
+            selected = pick_oldest_completed(pending_retries)
 
         if not selected:
             self.model.app.status = ActiveStatus()
@@ -727,11 +696,12 @@ class RollingOpsManager(Object):
         lock = Lock(self)
 
         operation = lock.get_operation()
+        logger.info(f"_run_with_lock {operation}")
         if not operation:
             lock.complete()
             if self.model.unit.is_leader():
                 self._process_locks()
-                return
+            return
 
         callback = self.callback_targets.get(operation.callback_id)
         kwargs = operation.parsed_kwargs()
