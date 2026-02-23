@@ -135,9 +135,14 @@ LIBPATCH = 8
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S.%fZ"
 
 
-def _now_timestamp() -> str:
+def _now_timestamp_str() -> str:
     """UTC timestamp string with microseconds."""
     return datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT)
+
+
+def _now_timestamp() -> datetime:
+    """UTC timestamp string with microseconds."""
+    return datetime.now(timezone.utc)
 
 
 def _parse_timestamp(timestamp: str) -> Optional[datetime]:
@@ -163,8 +168,8 @@ class Operation:
     """A single queued operation."""
 
     callback_id: str
-    kwargs: str
-    requested_at: str
+    kwargs: dict[str, any]
+    requested_at: Optional[datetime]
     max_retry: int
 
     @classmethod
@@ -177,7 +182,7 @@ class Operation:
         """Create a new operation from a callback id and kwargs."""
         return cls(
             callback_id=callback_id,
-            kwargs=_args_to_json(kwargs),
+            kwargs=kwargs,
             requested_at=_now_timestamp(),
             max_retry=max_retry,
         )
@@ -186,8 +191,10 @@ class Operation:
         """Dict form (string-only values)."""
         return {
             "callback_id": self.callback_id,
-            "kwargs": self.kwargs,
-            "requested_at": self.requested_at,
+            "kwargs": _args_to_json(self.kwargs),
+            "requested_at": self.requested_at.strftime(TIMESTAMP_FORMAT)
+            if self.requested_at
+            else "",
             "max_retry": str(self.max_retry),
         }
 
@@ -195,18 +202,14 @@ class Operation:
         """Serialize to a string suitable for a Juju databag."""
         return json.dumps(self._to_dict(), separators=(",", ":"))
 
-    def parsed_kwargs(self) -> dict[str, any]:
-        """Parsed kwargs for callback execution."""
-        return json.loads(self.kwargs) if self.kwargs else {}
-
     @classmethod
     def from_string(cls, data: str) -> "Operation":
         """Deserialize from a Juju databag string."""
         obj = json.loads(data)
         return cls(
             callback_id=obj["callback_id"],
-            kwargs=obj["kwargs"],
-            requested_at=obj["requested_at"],
+            kwargs=json.loads(obj["kwargs"]) if obj.get("kwargs") else {},
+            requested_at=_parse_timestamp(obj["requested_at"]),
             max_retry=int(obj["max_retry"]),
         )
 
@@ -218,7 +221,7 @@ class Operation:
 
     def __hash__(self) -> int:
         """Hash for the operation."""
-        return hash((self.callback_id, self.kwargs))
+        return hash((self.callback_id, _args_to_json(self.kwargs)))
 
 
 class OperationQueue:
@@ -342,7 +345,7 @@ class Lock:
             self.complete()
             return
         self.relation.data[self.unit].update({
-            "executed_at": _now_timestamp(),
+            "executed_at": _now_timestamp_str(),
             "state": LockIntent.RETRY.value,
         })
         self._increase_attempt()
@@ -360,7 +363,7 @@ class Lock:
             "state": next_state,
             "attempt": "",
             "operations": queue.to_string(),
-            "executed_at": _now_timestamp(),
+            "executed_at": _now_timestamp_str(),
         })
 
     def release(self):
@@ -374,7 +377,7 @@ class Lock:
         """Grant a lock to a unit."""
         self.relation.data[self.app].update({
             "granted_unit": str(self.unit),
-            "granted_at": _now_timestamp(),
+            "granted_at": _now_timestamp_str(),
         })
 
     def is_granted(self) -> bool:
@@ -388,14 +391,7 @@ class Lock:
 
     def should_release(self) -> bool:
         """Return True if the unit finished executing the callback and should be released."""
-        logger.info(f"should_release {self.is_completed()} {self._unit_executed_after_grant()}")
-        return  self.is_completed() or self._unit_executed_after_grant()  # REQUEST - granted
-
-    def is_held(self) -> bool:
-        """Return True if the unit holds the lock."""
-        unit_intent = self.relation.data[self.unit].get("state")
-        granted_unit = self.relation.data[self.app].get("granted_unit", "")
-        return unit_intent == LockIntent.REQUEST.value and granted_unit == str(self.unit)
+        return self.is_completed() or self._unit_executed_after_grant()  # REQUEST - granted
 
     def is_waiting(self) -> bool:
         """Return True if this unit is waiting for a lock to be granted."""
@@ -459,18 +455,15 @@ class Lock:
         operation = self.get_operation()
         if not operation:
             return None
-        return _parse_timestamp(operation.requested_at)
+        return operation.requested_at
 
     def _unit_executed_after_grant(self) -> bool:
         granted_at = _parse_timestamp(self.relation.data[self.app].get("granted_at", ""))
         executed_at = _parse_timestamp(self.relation.data[self.unit].get("executed_at", ""))
 
-        if granted_at is None:
+        if granted_at is None or executed_at is None:
             return False
-        if executed_at is None:
-            return False
-        logger.info(f"_unit_executed_after_grant {  executed_at > granted_at}")
-        return  executed_at > granted_at
+        return executed_at > granted_at
 
 
 class Locks:
@@ -532,7 +525,7 @@ def pick_oldest_completed(locks: list[Lock]) -> Optional[Lock]:
     return selected
 
 
-def pick_oldest_request(locks: list["Lock"]) -> Optional["Lock"]:
+def pick_oldest_request(locks: list[Lock]) -> Optional[Lock]:
     """Choose the lock with the oldest head operation."""
     selected = None
     oldest_request = None
@@ -630,7 +623,7 @@ class RollingOpsManager(Object):
 
         if granted_unit:
             logger.info("Current granted_unit=%s. No new unit will be scheduled.", granted_unit)
-            return  # REQUEST - GRANTED -> running get out
+            return
 
         self._schedule()
 
@@ -641,19 +634,11 @@ class RollingOpsManager(Object):
         pending_retries = []
 
         for lock in Locks(self):
-            unit_state = lock.relation.data[lock.unit].get("state", "")
-            granted_unit = lock.relation.data[lock.app].get("granted_unit", "")
-
-            logger.info(f"PROCESSING {lock.unit} unit={unit_state} app={granted_unit}")
-
             if lock.is_waiting():  # REQUEST - none
                 pending_requests.append(lock)
 
             elif lock.is_waiting_retry():  # RETRY - none
                 pending_retries.append(lock)
-
-        logger.info(f"pending_requests {pending_requests}")
-        logger.info(f"pending_retries {pending_retries}")
 
         selected = None
         if pending_requests:
@@ -694,9 +679,7 @@ class RollingOpsManager(Object):
 
     def _run_with_lock(self: CharmBase):
         lock = Lock(self)
-
         operation = lock.get_operation()
-        logger.info(f"_run_with_lock {operation}")
         if not operation:
             lock.complete()
             if self.model.unit.is_leader():
@@ -704,14 +687,12 @@ class RollingOpsManager(Object):
             return
 
         callback = self.callback_targets.get(operation.callback_id)
-        kwargs = operation.parsed_kwargs()
-
         logger.info(
             "Executing attempt=%s callback_id=%s", lock.get_attempt(), operation.callback_id
         )
 
         try:
-            result = callback(**kwargs)
+            result = callback(**operation.kwargs)
         except Exception as e:
             logger.error("Operation failed: %s: %s", operation.callback_id, e)
             result = OperationResult.RETRY

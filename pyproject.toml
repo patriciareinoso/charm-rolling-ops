@@ -27,6 +27,7 @@ codespell = "^2.4.1"
 coverage = {extras = ["toml"], version = "^7.13.1"}
 pytest = "^9.0.2"
 pytest-asyncio = "*"
+ops = { version = ">=3.0.0", extras = ["testing"] }
 
 [tool.poetry.group.integration.dependencies]
 pytest = "^9.0.2"
