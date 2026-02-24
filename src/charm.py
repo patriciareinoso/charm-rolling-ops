@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 class CharmRollingOpsCharm(CharmBase):
     """Charm the service."""
 
+    #on = RollingOpsManagerEvents()
     def __init__(self, *args):
         super().__init__(*args)
 
@@ -52,8 +53,7 @@ class CharmRollingOpsCharm(CharmBase):
 
     def _failed_restart(self, delay: int = 0):
         logger.info("Starting failed restart operation")
-        attempt = self.relation.data[self.unit].get("attempt", 0)
-        self.model.unit.status = MaintenanceStatus(f"Executing _failed_restart operation attemp={attempt}")
+        self.model.unit.status = MaintenanceStatus("Executing _failed_restart operation")
         time.sleep(int(delay))
         self.model.unit.status = MaintenanceStatus("Rolling restart operation failed")
         return OperationResult.RETRY

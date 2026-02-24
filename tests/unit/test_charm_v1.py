@@ -64,7 +64,7 @@ def test_operation_create_sets_fields():
 
 def test_operation_to_string_contains_string_values_only():
     ts = datetime(2026, 2, 23, 12, 0, 0, 123456, tzinfo=timezone.utc)
-    op = Operation(callback_id="cb", kwargs={"b": 2, "a": 1}, requested_at=ts, max_retry=-1)
+    op = Operation(callback_id="cb", kwargs={"b": 2, "a": 1}, requested_at=ts, max_retry=-1, attempt=0)
 
     s = op.to_string()
     obj = json.loads(s)
@@ -89,7 +89,7 @@ def test_operation_equality_and_hash_ignore_timestamp_and_max_retry():
 
 def test_operation_to_string_and_from_string():
     ts = datetime(2026, 2, 23, 12, 0, 0, 0, tzinfo=timezone.utc)
-    op1 = Operation(callback_id="cb", kwargs={"x": 1, "y": "z"}, requested_at=ts, max_retry=5)
+    op1 = Operation(callback_id="cb", kwargs={"x": 1, "y": "z"}, requested_at=ts, max_retry=5, attempt=0)
 
     s = op1.to_string()
     op2 = Operation.from_string(s)
@@ -240,7 +240,6 @@ def test_new_request_does_not_overwrite_state_if_queue_not_empty():
         endpoint="restart",
         local_unit_data={
             "state": "retry",
-            "attempt": "2",
             "executed_at": executed_at,
             "operations": queue.to_string(),
         },
@@ -251,7 +250,6 @@ def test_new_request_does_not_overwrite_state_if_queue_not_empty():
 
     databag = _unit_databag(state_out, peer)
     assert databag["state"] == "retry"
-    assert databag["attempt"] == "2"
     assert databag["executed_at"] == executed_at
     result = OperationQueue.from_string(databag["operations"])
     assert len(result) == 2
@@ -297,7 +295,7 @@ def test_lock_complete_pops_head():
     databag = _unit_databag(state_out, peer)
     assert databag["state"] == "idle"
     assert databag["executed_at"] is not None
-    assert databag.get("attempt", None) is None
+    assert databag.get("operations", None) == "[]"
 
     q = OperationQueue.from_string(databag["operations"])
     assert len(q) == 0
@@ -346,7 +344,6 @@ def test_lock_retry_marks_retry():
     databag = _unit_databag(state_out, peer)
     assert databag["state"] == "retry"
     assert databag["executed_at"] is not None
-    assert databag["attempt"] == "0"
 
     q = OperationQueue.from_string(databag["operations"])
     assert len(q) == 1
@@ -356,16 +353,21 @@ def test_lock_retry_marks_retry():
     assert current_operation.kwargs == initial_operation.kwargs
     assert current_operation.max_retry == initial_operation.max_retry
     assert current_operation.requested_at == initial_operation.requested_at
+    assert current_operation.attempt == 1
 
 
 def test_lock_retry_drops_when_max_retry_reached():
     ctx = Context(CharmRollingOpsCharm)
     remote_unit_name = f"{ctx.app_name}/1"
     local_unit_name = f"<ops.model.Unit {ctx.app_name}/0>"
-    queue = _make_operation_queue(callback_id="_failed_restart", kwargs={}, max_retry=3)
+    operation = Operation(
+        callback_id="_failed_restart", kwargs={}, max_retry=3, requested_at=_now_timestamp(), attempt=3
+    )
+    queue = OperationQueue()
+    queue._enqueue(operation)
     peer = PeerRelation(
         endpoint="restart",
-        local_unit_data={"state": "request", "operations": queue.to_string(), "attempt": "3"},
+        local_unit_data={"state": "request", "operations": queue.to_string()},
         local_app_data={"granted_unit": local_unit_name, "granted_at": _now_timestamp_str()},
     )
     state_in = State(leader=False, relations={peer})
@@ -375,7 +377,6 @@ def test_lock_retry_drops_when_max_retry_reached():
     databag = _unit_databag(state_out, peer)
     assert databag["state"] == "idle"
     assert databag["executed_at"] is not None
-    assert databag.get("attempt", None) is None
 
     q = OperationQueue.from_string(databag["operations"])
     assert len(q) == 0
@@ -424,13 +425,13 @@ def test_schedule_picks_oldest_requested_at_among_requests():
 
     old_queue = OperationQueue()
     old_operation = Operation(
-        callback_id="restart", kwargs={}, max_retry=2, requested_at=_now_timestamp()
+        callback_id="restart", kwargs={}, max_retry=2, requested_at=_now_timestamp(), attempt=0
     )
     old_queue._enqueue(old_operation)
 
     new_queue = OperationQueue()
     new_operation = Operation(
-        callback_id="restart", kwargs={}, max_retry=2, requested_at=_now_timestamp()
+        callback_id="restart", kwargs={}, max_retry=2, requested_at=_now_timestamp(), attempt=0
     )
     new_queue._enqueue(new_operation)
 
@@ -462,13 +463,11 @@ def test_schedule_picks_oldest_executed_at_among_retries_when_no_requests():
             1: {
                 "state": "retry",
                 "operations": queue.to_string(),
-                "attempt": "2",
                 "executed_at": new_operation,
             },
             2: {
                 "state": "retry",
                 "operations": queue.to_string(),
-                "attempt": "0",
                 "executed_at": old_operation,
             },
         },
@@ -492,7 +491,6 @@ def test_schedule_prioritizes_requests_over_retries():
             1: {
                 "state": "retry",
                 "operations": queue.to_string(),
-                "attempt": "2",
                 "executed_at": _now_timestamp_str(),
             },
             2: {"state": "request", "operations": queue.to_string()},

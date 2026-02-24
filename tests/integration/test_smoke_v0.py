@@ -58,7 +58,7 @@ async def test_smoke(ops_test: OpsTest):
     model_full_name: str = ops_test.model_full_name
 
     # Deploy, and verify deployment
-    charm = await ops_test.build_charm(".")
+    charm = await ops_test.build_charm("tests/charms/v0")
     await asyncio.gather(ops_test.model.deploy(charm, application_name="rolling-ops", num_units=3))
 
     # to spare the typechecker errors
