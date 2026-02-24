@@ -18,7 +18,7 @@ import json
 from datetime import datetime, timezone
 
 import pytest
-from charms.rolling_ops.v0.rollingops import (
+from charms.rolling_ops.v1.rollingops import (
     TIMESTAMP_FORMAT,
     Operation,
     OperationQueue,
@@ -206,14 +206,14 @@ def test_lock_request_enqueues_and_sets_request():
     len(q) == 1
     operation = q.peek()
     assert operation.callback_id == "_restart"
-    assert operation.kwargs == {}
+    assert operation.kwargs == {"delay": 10}
     assert operation.max_retry == -1
     assert operation.requested_at is not None
 
 
 def test_existing_operation_then_new_request():
     ctx = Context(CharmRollingOpsCharm)
-    queue = _make_operation_queue(callback_id="_custom_restart", kwargs={}, max_retry=3)
+    queue = _make_operation_queue(callback_id="_failed_restart", kwargs={}, max_retry=3)
     peer = PeerRelation(
         endpoint="restart",
         local_unit_data={"state": "request", "operations": queue.to_string()},
@@ -228,13 +228,13 @@ def test_existing_operation_then_new_request():
     result = OperationQueue.from_string(databag["operations"])
 
     assert len(result) == 2
-    assert result.operations[0].callback_id == "_custom_restart"
+    assert result.operations[0].callback_id == "_failed_restart"
     assert result.operations[1].callback_id == "_restart"
 
 
 def test_new_request_does_not_overwrite_state_if_queue_not_empty():
     ctx = Context(CharmRollingOpsCharm)
-    queue = _make_operation_queue(callback_id="_custom_restart", kwargs={}, max_retry=3)
+    queue = _make_operation_queue(callback_id="_failed_restart", kwargs={}, max_retry=3)
     executed_at = _now_timestamp_str()
     peer = PeerRelation(
         endpoint="restart",
@@ -255,14 +255,14 @@ def test_new_request_does_not_overwrite_state_if_queue_not_empty():
     assert databag["executed_at"] == executed_at
     result = OperationQueue.from_string(databag["operations"])
     assert len(result) == 2
-    assert result.operations[0].callback_id == "_custom_restart"
+    assert result.operations[0].callback_id == "_failed_restart"
     assert result.operations[1].callback_id == "_restart"
 
 
 def test_relation_changed_without_grant_does_not_run_operation():
     ctx = Context(CharmRollingOpsCharm)
     remote_unit_name = f"{ctx.app_name}/1"
-    queue = _make_operation_queue(callback_id="_custom_restart", kwargs={}, max_retry=3)
+    queue = _make_operation_queue(callback_id="_failed_restart", kwargs={}, max_retry=3)
     peer = PeerRelation(
         endpoint="restart",
         local_unit_data={"state": "request", "operations": queue.to_string()},
@@ -284,7 +284,7 @@ def test_lock_complete_pops_head():
     ctx = Context(CharmRollingOpsCharm)
     remote_unit_name = f"{ctx.app_name}/1"
     local_unit_name = f"<ops.model.Unit {ctx.app_name}/0>"
-    queue = _make_operation_queue(callback_id="_restart", kwargs={}, max_retry=3)
+    queue = _make_operation_queue(callback_id="_restart", kwargs={}, max_retry=0)
     peer = PeerRelation(
         endpoint="restart",
         local_unit_data={"state": "request", "operations": queue.to_string()},
@@ -309,7 +309,7 @@ def test_successful_operation_leaves_state_request_when_more_ops_remain():
     remote_unit_name = f"{ctx.app_name}/1"
     queue = OperationQueue()
     queue.enqueue_lock_request(callback_id="_restart", kwargs={}, max_retry=-1)
-    queue.enqueue_lock_request(callback_id="_custom_restart", kwargs={}, max_retry=-1)
+    queue.enqueue_lock_request(callback_id="_failed_restart", kwargs={}, max_retry=-1)
 
     peer = PeerRelation(
         endpoint="restart",
@@ -326,14 +326,14 @@ def test_successful_operation_leaves_state_request_when_more_ops_remain():
     q = OperationQueue.from_string(databag["operations"])
     assert len(q) == 1
     current_operation = q.peek()
-    assert current_operation.callback_id == "_custom_restart"
+    assert current_operation.callback_id == "_failed_restart"
 
 
 def test_lock_retry_marks_retry():
     ctx = Context(CharmRollingOpsCharm)
     remote_unit_name = f"{ctx.app_name}/1"
     local_unit_name = f"<ops.model.Unit {ctx.app_name}/0>"
-    queue = _make_operation_queue(callback_id="_custom_restart", kwargs={}, max_retry=3)
+    queue = _make_operation_queue(callback_id="_failed_restart", kwargs={}, max_retry=3)
     peer = PeerRelation(
         endpoint="restart",
         local_unit_data={"state": "request", "operations": queue.to_string()},
@@ -362,7 +362,7 @@ def test_lock_retry_drops_when_max_retry_reached():
     ctx = Context(CharmRollingOpsCharm)
     remote_unit_name = f"{ctx.app_name}/1"
     local_unit_name = f"<ops.model.Unit {ctx.app_name}/0>"
-    queue = _make_operation_queue(callback_id="_custom_restart", kwargs={}, max_retry=3)
+    queue = _make_operation_queue(callback_id="_failed_restart", kwargs={}, max_retry=3)
     peer = PeerRelation(
         endpoint="restart",
         local_unit_data={"state": "request", "operations": queue.to_string(), "attempt": "3"},
@@ -383,7 +383,7 @@ def test_lock_retry_drops_when_max_retry_reached():
 
 def test_lock_grant_and_release():
     ctx = Context(CharmRollingOpsCharm)
-    queue = _make_operation_queue(callback_id="_custom_restart", kwargs={}, max_retry=3)
+    queue = _make_operation_queue(callback_id="_failed_restart", kwargs={}, max_retry=3)
     peer = PeerRelation(
         endpoint="restart", peers_data={1: {"state": "request", "operations": queue.to_string()}}
     )
@@ -399,7 +399,7 @@ def test_lock_grant_and_release():
 
 def test_scheduling_does_nothing_if_lock_already_granted():
     ctx = Context(CharmRollingOpsCharm)
-    queue = _make_operation_queue(callback_id="_custom_restart", kwargs={}, max_retry=3)
+    queue = _make_operation_queue(callback_id="_failed_restart", kwargs={}, max_retry=3)
     remote_unit_name = f"{ctx.app_name}/1"
     now_timestamp = _now_timestamp_str()
     peer = PeerRelation(
@@ -453,7 +453,7 @@ def test_schedule_picks_oldest_executed_at_among_retries_when_no_requests():
     ctx = Context(CharmRollingOpsCharm)
 
     old_operation = _now_timestamp_str()
-    queue = _make_operation_queue(callback_id="_custom_restart", kwargs={}, max_retry=3)
+    queue = _make_operation_queue(callback_id="_failed_restart", kwargs={}, max_retry=3)
     new_operation = _now_timestamp_str()
 
     peer = PeerRelation(
@@ -484,7 +484,7 @@ def test_schedule_picks_oldest_executed_at_among_retries_when_no_requests():
 
 def test_schedule_prioritizes_requests_over_retries():
     ctx = Context(CharmRollingOpsCharm)
-    queue = _make_operation_queue(callback_id="_custom_restart", kwargs={}, max_retry=3)
+    queue = _make_operation_queue(callback_id="_failed_restart", kwargs={}, max_retry=3)
 
     peer = PeerRelation(
         endpoint="restart",
