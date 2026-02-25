@@ -103,29 +103,28 @@ restart. (An operator might take advantage of this fact to recover from a failed
 operation without restarting workloads that were able to successfully restart -- simply
 omit the successful units from a subsequent run-action call.)
 """
+
+import argparse
 import json
 import logging
 import os
 import signal
 import subprocess
-import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-
-from ops.charm import CharmBase, CharmEvents
 from sys import version_info
-from time import sleep
-from typing import AnyStr, Optional
-from ops.framework import EventBase, EventSource, Object, ObjectEvents
+from typing import Any, Optional
+
+from ops import Relation
 from ops.charm import (
     CharmBase,
     RelationChangedEvent,
     RelationDepartedEvent,
 )
 from ops.framework import EventBase, Object
-from ops.model import ActiveStatus
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +161,7 @@ def _parse_timestamp(timestamp: str) -> Optional[datetime]:
         return None
 
 
-def _args_to_json(data: dict[str, any]) -> str:
+def _args_to_json(data: dict[str, Any]) -> str:
     """Deterministic JSON serialization for kwargs."""
     return json.dumps(data, sort_keys=True, separators=(",", ":"))
 
@@ -176,17 +175,43 @@ class Operation:
     """A single queued operation."""
 
     callback_id: str
-    kwargs: dict[str, any]
+    kwargs: dict[str, Any]
     requested_at: Optional[datetime]
-    max_retry: int
+    max_retry: Optional[int]
     attempt: int
+
+    def __post_init__(self) -> None:
+        """Vallidate the class attributes."""
+        if not isinstance(self.callback_id, str) or not self.callback_id.strip():
+            raise ValueError("callback_id must be a non-empty string")
+
+        if not isinstance(self.kwargs, dict):
+            raise ValueError("kwargs must be a dict")
+        try:
+            json.dumps(self.kwargs)
+        except TypeError as e:
+            raise ValueError(f"kwargs must be JSON-serializable: {e}") from e
+
+        if self.requested_at is not None and not isinstance(self.requested_at, datetime):
+            raise ValueError("requested_at must be a datetime or None")
+
+        if self.max_retry:
+            if not isinstance(self.max_retry, int):
+                raise ValueError("max_retry must be an int")
+            if self.max_retry < 0:
+                raise ValueError("max_retry must be >= 0")
+
+        if not isinstance(self.attempt, int):
+            raise ValueError("attempt must be an int")
+        if self.attempt < 0:
+            raise ValueError("attempt must be >= 0")
 
     @classmethod
     def create(
         cls,
         callback_id: str,
-        kwargs: dict[str, any],
-        max_retry: int = -1,
+        kwargs: dict[str, Any],
+        max_retry: int | None = None,
     ) -> "Operation":
         """Create a new operation from a callback id and kwargs."""
         return cls(
@@ -194,7 +219,7 @@ class Operation:
             kwargs=kwargs,
             requested_at=_now_timestamp(),
             max_retry=max_retry,
-            attempt=0
+            attempt=0,
         )
 
     def _to_dict(self) -> dict[str, str]:
@@ -205,7 +230,7 @@ class Operation:
             "requested_at": self.requested_at.strftime(TIMESTAMP_FORMAT)
             if self.requested_at
             else "",
-            "max_retry": str(self.max_retry),
+            "max_retry": str(self.max_retry) if self.max_retry else "",
             "attempt": str(self.attempt),
         }
 
@@ -218,8 +243,8 @@ class Operation:
         self.attempt += 1
 
     def is_max_retry_reached(self) -> bool:
-        """Return True if attempt exceeds max_retry (unless max_retry < 0)."""
-        if self.max_retry < 0:
+        """Return True if attempt exceeds max_retry (unless max_retry is None)."""
+        if not self.max_retry:
             return False
         return self.attempt > self.max_retry
 
@@ -230,8 +255,10 @@ class Operation:
         return cls(
             callback_id=obj["callback_id"],
             kwargs=json.loads(obj["kwargs"]) if obj.get("kwargs") else {},
-            requested_at=_parse_timestamp(obj["requested_at"]),
-            max_retry=int(obj["max_retry"]),
+            requested_at=_parse_timestamp(obj["requested_at"])
+            if obj.get("requested_at")
+            else None,
+            max_retry=int(obj["max_retry"]) if obj.get("max_retry") else None,
             attempt=int(obj["attempt"]),
         )
 
@@ -290,7 +317,7 @@ class OperationQueue:
         self.operations[0].increase_attempt()
 
     def enqueue_lock_request(
-        self, callback_id: str, kwargs: dict[str, any], max_retry: int = -1
+        self, callback_id: str, kwargs: dict[str, Any], max_retry: int | None = None
     ) -> bool:
         """Enqueue a lock request."""
         return self._enqueue(Operation.create(callback_id, kwargs, max_retry=max_retry))
@@ -348,20 +375,34 @@ class Lock:
         self.unit = unit or manager.model.unit
         self.app = manager.model.app
 
-    def request(self, callback_id: str, kwargs: dict, max_retry: int | None = -1):
+    @property
+    def _app_data(self):
+        return self.relation.data[self.app]
+
+    @property
+    def _unit_data(self):
+        return self.relation.data[self.unit]
+
+    @property
+    def _operations(self) -> OperationQueue:
+        return OperationQueue.from_string(self._unit_data.get("operations", ""))
+
+    def request(self, callback_id: str, kwargs: dict, max_retry: int | None = None):
         """Enqueue an operation and mark this unit as requesting the lock.
 
         Args:
           callback_id: identifies which callback to execute.
           kwargs: dict of callback kwargs.
-          max_retry: None -> unlimited retries (-1), else explicit integer.
+          max_retry: None -> unlimited retries, else explicit integer.
         """
-        queue = OperationQueue.from_string(self.relation.data[self.unit].get("operations", ""))
+        queue = self._operations
         if queue.is_empty():
-            self.relation.data[self.unit].update({"state": LockIntent.REQUEST.value})
-        op_max_retry = -1 if (max_retry is None or max_retry <= -1) else max_retry
-        queue.enqueue_lock_request(callback_id, kwargs, max_retry=op_max_retry)
-        self.relation.data[self.unit].update({"operations": queue.to_string()})
+            self._unit_data.update({"state": LockIntent.REQUEST.value})
+        if queue.enqueue_lock_request(callback_id, kwargs, max_retry):
+            logger.debug("Operation added to the queue.")
+        else:
+            logger.info("Operation %s not added to queue.")
+        self._unit_data.update({"operations": queue.to_string()})
 
     def retry(self):
         """Mark retry for the head operation.
@@ -373,7 +414,7 @@ class Lock:
             logger.info("Operation max retry reached. Dropping")
             self.complete()
             return
-        self.relation.data[self.unit].update({
+        self._unit_data.update({
             "executed_at": _now_timestamp_str(),
             "state": LockIntent.RETRY.value,
         })
@@ -383,11 +424,11 @@ class Lock:
 
         Update unit state depending on whether more operations remain.
         """
-        queue = OperationQueue.from_string(self.relation.data[self.unit].get("operations", ""))
+        queue = self._operations
         queue.dequeue()
         next_state = LockIntent.REQUEST.value if queue.peek() else LockIntent.IDLE.value
 
-        self.relation.data[self.unit].update({
+        self._unit_data.update({
             "state": next_state,
             "operations": queue.to_string(),
             "executed_at": _now_timestamp_str(),
@@ -395,96 +436,88 @@ class Lock:
 
     def release(self):
         """Clear the application-level grant."""
-        self.relation.data[self.app].update({
-            "granted_unit": "",
-            "granted_at": "",
-        })
+        self._app_data.update({"granted_unit": "", "granted_at": ""})
 
     def grant(self) -> None:
         """Grant a lock to a unit."""
-        self.relation.data[self.app].update({
-            "granted_unit": str(self.unit),
+        self._app_data.update({
+            "granted_unit": str(self.unit.name),
             "granted_at": _now_timestamp_str(),
         })
 
     def is_granted(self) -> bool:
         """Return True if the unit holds the lock."""
-        granted_unit = self.relation.data[self.app].get("granted_unit", "")
-        return granted_unit == str(self.unit)
+        granted_unit = self._app_data.get("granted_unit", "")
+        return granted_unit == str(self.unit.name)
 
     def should_run(self) -> bool:
         """Return True if the lock has been granted to the unit and it is time to execute callback."""
-        return self.is_granted() and not self._unit_executed_after_grant()  # REQUEST - GRANTED
+        return self.is_granted() and not self._unit_executed_after_grant()
 
     def should_release(self) -> bool:
         """Return True if the unit finished executing the callback and should be released."""
-        return self.is_completed() or self._unit_executed_after_grant()  # REQUEST - granted
+        return self.is_completed() or self._unit_executed_after_grant()
 
     def is_waiting(self) -> bool:
         """Return True if this unit is waiting for a lock to be granted."""
-        unit_intent = self.relation.data[self.unit].get("state")
-        granted_unit = self.relation.data[self.app].get("granted_unit", "")
-        return unit_intent == LockIntent.REQUEST.value and granted_unit != str(self.unit)
+        unit_intent = self._unit_data.get("state")
+        return unit_intent == LockIntent.REQUEST.value and not self.is_granted()
 
     def is_completed(self) -> bool:
         """Return True if this unit is completed callback but still has the grant (leader should clear)."""
-        unit_intent = self.relation.data[self.unit].get("state")
+        unit_intent = self._unit_data.get("state")
         return unit_intent == LockIntent.IDLE.value and self.is_granted()
 
     def is_retry(self) -> bool:
         """Return True if this unit requested retry but still has the grant (leader should clear)."""
-        unit_intent = self.relation.data[self.unit].get("state")
-        granted_unit = self.relation.data[self.app].get("granted_unit", "")
-        return unit_intent == LockIntent.RETRY.value and granted_unit == str(self.unit)
+        unit_intent = self._unit_data.get("state")
+        return unit_intent == LockIntent.RETRY.value and self.is_granted()
 
     def is_waiting_retry(self) -> bool:
         """Return True if the unit requested retry and is waiting for lock to be granted."""
-        unit_intent = self.relation.data[self.unit].get("state")
-        granted_unit = self.relation.data[self.app].get("granted_unit", "")
-        return unit_intent == LockIntent.RETRY.value and granted_unit != str(self.unit)
+        unit_intent = self._unit_data.get("state")
+        return unit_intent == LockIntent.RETRY.value and not self.is_granted()
 
-    def get_operation(self) -> Operation | None:
+    def get_current_operation(self) -> Operation | None:
         """Return the head operation for this unit, if any."""
-        q = OperationQueue.from_string(self.relation.data[self.unit].get("operations", ""))
-        return q.peek()
+        return self._operations.peek()
 
     def _is_max_retry_reached(self) -> bool:
         """Return True if the head operation exceeded its max_retry (unless max_retry < 0)."""
-        operation = self.get_operation()
+        operation = self.get_current_operation()
         if not operation:
             return True
         return operation.is_max_retry_reached()
 
     def _increase_attempt(self) -> None:
         """Increment the attempt counter for the head operation and persist it."""
-        raw = self.relation.data[self.unit].get("operations", "")
+        raw = self._unit_data.get("operations", "")
         q = OperationQueue.from_string(raw)
 
         q.increase_attempt()
 
-        self.relation.data[self.unit]["operations"] = q.to_string()
+        self._unit_data.update({"operations": q.to_string()})
 
     def get_last_completed(self) -> datetime | None:
         """Get the time the unit requested a retry of the head operation."""
-        timestamp_str = self.relation.data[self.unit].get("executed_at", "")
+        timestamp_str = self._unit_data.get("executed_at", "")
         if timestamp_str:
             return _parse_timestamp(timestamp_str)
         return None
 
     def get_requested_at(self) -> datetime | None:
         """Get the time the head operation was requested at."""
-        operation = self.get_operation()
+        operation = self.get_current_operation()
         if not operation:
             return None
         return operation.requested_at
 
     def _unit_executed_after_grant(self) -> bool:
-        granted_at = _parse_timestamp(self.relation.data[self.app].get("granted_at", ""))
-        executed_at = _parse_timestamp(self.relation.data[self.unit].get("executed_at", ""))
+        granted_at = _parse_timestamp(self._app_data.get("granted_at", ""))
+        executed_at = _parse_timestamp(self._unit_data.get("executed_at", ""))
 
         if granted_at is None or executed_at is None:
             return False
-        logger.info(f"_unit_executed_after_grant {executed_at} {granted_at} {executed_at > granted_at}")
         return executed_at > granted_at
 
 
@@ -508,7 +541,7 @@ class AcquireLock(EventBase):
     """Signals that this unit wants to acquire a lock."""
 
     def __init__(
-        self, handle, callback_id: str, kwargs: dict[str, any] = {}, max_retry: int | None = None
+        self, handle, callback_id: str, kwargs: dict[str, Any] = {}, max_retry: int | None = None
     ):
         super().__init__(handle)
         self.callback_id = callback_id
@@ -564,69 +597,53 @@ def pick_oldest_request(locks: list[Lock]) -> Optional[Lock]:
     return selected
 
 
-class ProcessLocks(EventBase):
-    """Used to tell the leader to process all locks."""
-
-class RunLeaderWithLock(EventBase):
-    """Used to"""
-
-class RollingOpGrantedEvent(EventBase):
+class RollingOpsLockGrantedEvent(EventBase):
     """Custom event emitted when the background worker grants the lock."""
 
-class RollingOpsManagerEvents(ObjectEvents):
-    rollingop_granted = EventSource(RollingOpGrantedEvent)
 
 class RollingOpsManagerV1(Object):
     """Emitters and handlers for rolling ops."""
-    #on = RollingOpsManagerEvents()
 
-    def __init__(self, charm: CharmBase, relation: AnyStr, callback_targets: dict[str, any]):
+    def __init__(self, charm: CharmBase, relation_name: str, callback_targets: dict[str, Any]):
         """Register our custom events.
 
         params:
             charm: the charm we are attaching this to.
-            relation: the peer relation name from metadata.yaml.
-            callback: mapping from callback_id -> callable.
+            relation_name: the peer relation name from metadata.yaml.
+            callback_targets: mapping from callback_id -> callable.
         """
-        super().__init__(charm, relation)
-        self.charm = charm
-        self.relation_name = relation
+        super().__init__(charm, "rolling-ops-manager")
+        self._charm = charm
+        self.relation_name = relation_name
         self.callback_targets = callback_targets
         self.charm_dir = charm.charm_dir
+        self.worker = RollingOpsAsyncWorker(charm, relation_name=relation_name)
 
-        charm.on.define_event("rollingop_granted", RollingOpGrantedEvent)
-        #self.framework.observe(charm.on.run_leader_with_lock, self._on_run_leader_with_lock)
+        charm.on.define_event("rollingop_lock_granted", RollingOpsLockGrantedEvent)
+
         self.framework.observe(
             charm.on[self.relation_name].relation_changed, self._on_relation_changed
         )
-        self.framework.observe(charm.on.leader_elected, self._process_locks)
-        # self.framework.observe(charm.on.update_status, self._on_run_leader_with_lock)
         self.framework.observe(
             charm.on[self.relation_name].relation_departed, self._on_relation_departed
         )
+        self.framework.observe(charm.on.leader_elected, self._process_locks)
+        self.framework.observe(charm.on.rollingop_lock_granted, self._on_rollingop_granted)
+        self.framework.observe(charm.on.update_status, self._on_rollingop_granted)
 
-        run_cmd = (
-            "/usr/bin/juju-exec" if self.model.juju_version.major > 2 else "/usr/bin/juju-run"
-        )
+    @property
+    def _relation(self) -> Relation | None:
+        return self.model.get_relation(self.relation_name)
 
-        self.worker = RollingOpsAsyncWorker(self, peers_relation_name="restart", run_cmd=run_cmd)
-        self.framework.observe(charm.on.rollingop_granted, self._on_rollingop_granted)
-
-
-    def _on_rollingop_granted(self, event):
-        if not self.model.unit.is_leader():
+    def _on_rollingop_granted(self, event: RollingOpsLockGrantedEvent) -> None:
+        if not self._relation:
             return
-
-        relation = self.model.get_relation("restart")
-        if not relation:
-            return
-        logger.info("THIS IS A DISPATCH")
+        logger.info("Received a rolling-op lock granted event.")
         lock = Lock(self)
         if lock.should_run():
-            logger.info("Running operation on leader unit.")
-            self._run_with_lock()
+            self._execute_operation()
 
-    def _on_relation_departed(self, event: RelationDepartedEvent):
+    def _on_relation_departed(self, event: RelationDepartedEvent) -> None:
         """Leader cleanup: if a departing unit was granted, clear the grant.
 
         This prevents deadlocks when the granted unit leaves the relation.
@@ -639,18 +656,40 @@ class RollingOpsManagerV1(Object):
                 lock.release()
                 self._process_locks()
 
-
-
-    def _on_relation_changed(self: CharmBase, event: RelationChangedEvent):
+    def _on_relation_changed(self, _: RelationChangedEvent) -> None:
         """Process relation changed."""
         if self.model.unit.is_leader():
             self._process_locks()
             return
-        
+
         lock = Lock(self)
         if lock.should_run():
-            self._run_with_lock()
-        
+            self._execute_operation()
+
+    def _valid_peer_unit_names(self) -> set[str]:
+        """Return all unit names currently participating in the peer relation."""
+        if not self._relation:
+            return set()
+        names = {u.name for u in self._relation.units}
+        names.add(self.model.unit.name)
+        return names
+
+    def _release_stale_grant(self):
+        """Ensure granted_unit refers to a unit currently on the peer relation."""
+        if not self._relation:
+            return
+
+        granted_unit = self._relation.data[self.model.app].get("granted_unit", "")
+        if not granted_unit:
+            return
+
+        valid_units = self._valid_peer_unit_names()
+        if granted_unit not in valid_units:
+            logger.warning(
+                "granted_unit=%s is not in current peer units; releasing stale grant.",
+                granted_unit,
+            )
+            self._relation.data[self.model.app].update({"granted_unit": "", "granted_at": ""})
 
     def _process_locks(self, _: EventBase = None):
         """Process locks."""
@@ -662,8 +701,8 @@ class RollingOpsManagerV1(Object):
                 lock.release()
                 break
 
-        relation = self.model.get_relation(self.relation_name)
-        granted_unit = relation.data[self.model.app].get("granted_unit", "")
+        self._release_stale_grant()
+        granted_unit = self._relation.data[self.model.app].get("granted_unit", "")
 
         if granted_unit:
             logger.info("Current granted_unit=%s. No new unit will be scheduled.", granted_unit)
@@ -672,17 +711,20 @@ class RollingOpsManagerV1(Object):
         self._schedule()
 
     def _schedule(self) -> None:
-        logger.info("Starting scheduling")
+        logger.info("Starting scheduling.")
 
         pending_requests = []
         pending_retries = []
 
         for lock in Locks(self):
-            if lock.is_waiting():  # REQUEST - none
+            if lock.is_waiting():
                 pending_requests.append(lock)
 
-            elif lock.is_waiting_retry():  # RETRY - none
+            elif lock.is_waiting_retry():
                 pending_retries.append(lock)
+
+        logger.info(f"pending_requests {pending_requests}")
+        logger.info(f"pending_retries {pending_retries}")
 
         selected = None
         if pending_requests:
@@ -691,103 +733,133 @@ class RollingOpsManagerV1(Object):
             selected = pick_oldest_completed(pending_retries)
 
         if not selected:
-            logger.info("Lock was not granted to any unit")
+            logger.info("No pending lock requests. Lock was not granted to any unit.")
             return
 
         selected.grant()
-        logger.info("Lock granted to unit=%s.", selected.unit)
+        logger.info("Lock granted to unit=%s.", selected.unit.name)
         if selected.unit == self.model.unit:
-            self.worker.start(callback_name="_restart", acquire_delay=5)
+            if lock.is_retry():
+                self.worker.start()
+                return
+            self._execute_operation()
 
-    def request_lock(
-        self: CharmBase,
+    def request_async_lock(
+        self,
         callback_id: str,
-        kwargs: dict[str, any] = {},
+        kwargs: dict[str, Any] | None = None,
         max_retry: int | None = None,
-    ):
-        """Request a lock."""
+    ) -> None:
+        """Enqueue a rolling operation and request the distributed lock.
+
+        This method appends an operation (identified by callback_id and kwargs) to the
+        calling unit's FIFO queue stored in the peer relation databag and marks the unit as
+        requesting the lock. It does not execute the operation directly.
+
+        Args:
+            callback_id: Identifier for the callback to execute when this unit is granted
+                the lock. Must be a non-empty string and should exist in the manager's
+                callback registry.
+            kwargs: Keyword arguments to pass to the callback when executed. If omitted,
+                an empty dict is used. Must be JSON-serializable because it is stored
+                in Juju relation databags.
+            max_retry: Retry limit for this operation. None means unlimited retries.
+                0 means no retries (drop immediately on first failure). Must be >= 0
+                when provided.
+
+        Raises:
+            ValueError: If any input is invalid (e.g. empty callback_id, non-dict kwargs,
+                non-serializable kwargs, negative max_retry).
+            LockNoRelationError: If the peer relation does not exist.
+        """
+        if callback_id not in self.callback_targets:
+            raise ValueError(f"Unknown callback_id: {callback_id}")
+
         try:
             lock = Lock(self)
             lock.request(callback_id, kwargs, max_retry)
 
             if self.model.unit.is_leader():
                 self._process_locks()
-
-        except LockNoRelationError:
+        except (ValueError, TypeError) as e:
+            logger.error("Failed to create the lock request: {}".format(e))
+            raise e
+        except LockNoRelationError as e:
             logger.debug(
                 "No {} peer relation yet. Delaying rolling op.".format(self.relation_name)
             )
+            raise e
 
-    def _run_with_lock(self: CharmBase):
+    def _execute_operation(self):
+        """Execute the current head operation if this unit holds the distributed lock.
+
+        - If this unit does not currently hold the lock grant, no operation is run.
+        - If this unit holds the grant but has no queued operation, lock is released.
+        - Otherwise, the operation's callback is looked up by `callback_id` and
+            invoked with the operation kwargs.
+        """
         lock = Lock(self)
-        operation = lock.get_operation()
-        if not operation:
-            lock.complete()
+        try:
+            if not lock.is_granted():
+                logger.debug("Lock is not granted. Operation will not run.")
+                return
+            operation = lock.get_current_operation()
+            if not operation:
+                logger.debug("There is no operation to run.")
+                lock.complete()
+                return
+
+            callback = self.callback_targets.get(operation.callback_id, "")
+            logger.debug(
+                "Executing callback_id=%s,  attempt=%s", operation.callback_id, operation.attempt
+            )
+
+            try:
+                result = callback(**operation.kwargs)
+            except Exception as e:
+                logger.error("Operation failed: %s: %s", operation.callback_id, e)
+                result = OperationResult.RETRY
+
+            if result == OperationResult.RETRY:
+                logger.info("Finished %s. Operation will be retried.", operation.callback_id)
+                lock.retry()
+            else:
+                logger.info("Finished %s. Lock will be released.", operation.callback_id)
+                lock.complete()
+        finally:
             if self.model.unit.is_leader():
                 self._process_locks()
-            return
-
-        callback = self.callback_targets.get(operation.callback_id)
-        logger.info(
-            "Executing attempt=%s callback_id=%s", operation.attempt, operation.callback_id
-        )
-
-        try:
-            result = callback(**operation.kwargs)
-        except Exception as e:
-            logger.error("Operation failed: %s: %s", operation.callback_id, e)
-            result = OperationResult.RETRY
-
-        if result == OperationResult.RETRY:
-            lock.retry()
-            logger.info("Finished: %s. Operation will be retried", operation.callback_id)
-        else:
-            lock.complete()
-            logger.info("Finished: %s. Lock will be released", operation.callback_id)
-
-        if self.model.unit.is_leader():
-            self._process_locks()
-
-
-LOG_FILE_PATH = "/var/log/rollingops_worker.log"
 
 
 class RollingOpsAsyncWorker(Object):
     """Spawns and manages the external rolling-ops worker process."""
 
-    def __init__(self, charm: CharmBase, peers_relation_name: str, run_cmd: str):
+    def __init__(self, charm: CharmBase, relation_name: str):
         super().__init__(charm, "rollingops-async-worker")
         self._charm = charm
-        self._peers_name = peers_relation_name
-        self._run_cmd = run_cmd
+        self._peers_name = relation_name
+        self._run_cmd = (
+            "/usr/bin/juju-exec" if self.model.juju_version.major > 2 else "/usr/bin/juju-run"
+        )
 
     @property
-    def _peers(self):
+    def _relation(self):
         return self._charm.model.get_relation(self._peers_name)
 
-    def start(self, callback_name: str, acquire_delay: int = 5):
-        """Start the worker process if not already running."""
-        if self._peers is None:
+    @property
+    def _app_data(self):
+        return self._relation.data[self.model.app]
+
+    def start(self):
+        """Start a new worker process."""
+        if self._relation is None:
             return
-
-        unit_data = self._peers.data[self._charm.model.unit]
-
-        # If already running, check PID still alive
-        pid_str = unit_data.get("rollingops-worker-pid", "")
-        if pid_str:
-            try:
-                os.kill(int(pid_str), 0)
-                logger.info("RollingOps worker already running with PID %s", pid_str)
-            except OSError:
-                logger.info("Stale worker PID %s; will respawn", pid_str)
-
-        logger.info("Starting RollingOps worker process")
+        self.stop()
 
         # Remove JUJU_CONTEXT_ID so juju-run works from the spawned process
         new_env = os.environ.copy()
         new_env.pop("JUJU_CONTEXT_ID", None)
 
-        # Ensure the charm venv site-packages are on PYTHONPATH (same trick as Postgres)
         for loc in new_env.get("PYTHONPATH", "").split(":"):
             path = Path(loc)
             venv_path = (
@@ -802,40 +874,34 @@ class RollingOpsAsyncWorker(Object):
                 new_env["PYTHONPATH"] = f"{venv_path.resolve()}:{new_env['PYTHONPATH']}"
                 break
 
-        # Persist the "what should I run" selection for the unit
-        unit_data.update({"rollingops-callback": callback_name})
+        worker = self._charm.charm_dir / "lib/charms/rolling_ops/v1" / "rollingops.py"
 
-        # Spawn the worker (simulation: sleeps then dispatches event)
-        worker = self._charm.charm_dir / "scripts" / "rollingops_worker.py"
-
-        proc = subprocess.Popen(
+        pid = subprocess.Popen(
             [
                 "/usr/bin/python3",
                 "-u",
                 str(worker),
-                "--acquire-delay", str(acquire_delay),
-                "--run-cmd", self._run_cmd,
-                "--unit-name", self._charm.model.unit.name,
-                "--charm-dir", str(self._charm.charm_dir),
-                "--event-name", "rollingop_granted",
+                "--run-cmd",
+                self._run_cmd,
+                "--unit-name",
+                self._charm.model.unit.name,
+                "--charm-dir",
+                str(self._charm.charm_dir),
             ],
             cwd=str(self._charm.charm_dir),
-            stdout=open(LOG_FILE_PATH, "a"),
+            stdout=open("/var/log/rollingops_worker.log", "a"),
             stderr=subprocess.STDOUT,
             env=new_env,
-        )
-        pid = proc.pid
+        ).pid
 
-
-        unit_data.update({"rollingops-worker-pid": str(pid)})
+        self._app_data.update({"rollingops-worker-pid": str(pid)})
         logger.info("Started RollingOps worker process with PID %s", pid)
 
     def stop(self):
         """Stop the running worker process if it exists."""
-        if self._peers is None:
+        if self._relation is None:
             return
-        unit_data = self._peers.data[self._charm.model.unit]
-        pid_str = unit_data.get("rollingops-worker-pid", "")
+        pid_str = self._app_data.get("rollingops-worker-pid", "")
         if not pid_str:
             return
 
@@ -845,4 +911,22 @@ class RollingOpsAsyncWorker(Object):
             logger.info("Stopped RollingOps worker process PID %s", pid)
         except OSError:
             pass
-        unit_data.update({"rollingops-worker-pid": ""})
+        self._app_data.update({"rollingops-worker-pid": ""})
+
+
+def main():
+    """Juju hook event dispatcher."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-cmd", required=True)
+    parser.add_argument("--unit-name", required=True)
+    parser.add_argument("--charm-dir", required=True)
+    args = parser.parse_args()
+
+    time.sleep(10)
+    dispatch_sub_cmd = f"JUJU_DISPATCH_PATH=hooks/rollingop_lock_granted {args.charm_dir}/dispatch"
+    res = subprocess.run([args.run_cmd, "-u", args.unit_name, dispatch_sub_cmd])
+    res.check_returncode()
+
+
+if __name__ == "__main__":
+    main()

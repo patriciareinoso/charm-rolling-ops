@@ -64,7 +64,9 @@ def test_operation_create_sets_fields():
 
 def test_operation_to_string_contains_string_values_only():
     ts = datetime(2026, 2, 23, 12, 0, 0, 123456, tzinfo=timezone.utc)
-    op = Operation(callback_id="cb", kwargs={"b": 2, "a": 1}, requested_at=ts, max_retry=-1, attempt=0)
+    op = Operation(
+        callback_id="cb", kwargs={"b": 2, "a": 1}, requested_at=ts, max_retry=None, attempt=0
+    )
 
     s = op.to_string()
     obj = json.loads(s)
@@ -72,7 +74,7 @@ def test_operation_to_string_contains_string_values_only():
     assert obj["callback_id"] == "cb"
     assert obj["kwargs"] == '{"a":1,"b":2}'
     assert obj["requested_at"] == ts.strftime(TIMESTAMP_FORMAT)
-    assert obj["max_retry"] == "-1"
+    assert obj.get("max_retry", "") == ""
 
 
 def test_operation_equality_and_hash_ignore_timestamp_and_max_retry():
@@ -89,7 +91,9 @@ def test_operation_equality_and_hash_ignore_timestamp_and_max_retry():
 
 def test_operation_to_string_and_from_string():
     ts = datetime(2026, 2, 23, 12, 0, 0, 0, tzinfo=timezone.utc)
-    op1 = Operation(callback_id="cb", kwargs={"x": 1, "y": "z"}, requested_at=ts, max_retry=5, attempt=0)
+    op1 = Operation(
+        callback_id="cb", kwargs={"x": 1, "y": "z"}, requested_at=ts, max_retry=5, attempt=0
+    )
 
     s = op1.to_string()
     op2 = Operation.from_string(s)
@@ -148,7 +152,7 @@ def test_queue_deduplicates_only_against_last_item():
 def test_queue_to_string_and_from_string():
     q1 = OperationQueue()
     q1.enqueue_lock_request("a", {"x": 1}, max_retry=5)
-    q1.enqueue_lock_request("b", {"y": "z"}, max_retry=-1)
+    q1.enqueue_lock_request("b", {"y": "z"}, max_retry=None)
 
     encoded = q1.to_string()
     q2 = OperationQueue.from_string(encoded)
@@ -184,7 +188,7 @@ def test_queue_encoding_is_list_of_operation_strings():
     op_dicts = _decode_queue_string(s)
     assert op_dicts[0]["callback_id"] == "a"
     assert op_dicts[0]["kwargs"] == '{"x":1}'
-    assert op_dicts[0]["max_retry"] == "-1"
+    assert op_dicts[0].get("max_retry", "") == ""
     assert "requested_at" in op_dicts[0]
 
 
@@ -207,8 +211,41 @@ def test_lock_request_enqueues_and_sets_request():
     operation = q.peek()
     assert operation.callback_id == "_restart"
     assert operation.kwargs == {"delay": 10}
-    assert operation.max_retry == -1
+    assert operation.max_retry is None
     assert operation.requested_at is not None
+
+
+@pytest.mark.parametrize(
+    "callback_id, kwargs, max_retry",
+    [
+        # callback_id
+        ("", {}, 0),
+        ("   ", {}, 0),
+        ("unknown", {}, 0),
+        (None, {}, 0),
+        (123, {}, 0),
+        # kwargs
+        ("_restart", "nope", 0),
+        ("_restart", [], 0),
+        ("_restart", {"x": OperationQueue()}, 0),
+        # max_retry
+        ("_restart", {}, -5),
+        ("_restart", {}, -1),
+        ("_restart", {}, "3"),
+    ],
+)
+def test_lock_request_invalid_inputs(callback_id, kwargs, max_retry):
+    ctx = Context(CharmRollingOpsCharm)
+    peer = PeerRelation(endpoint="restart")
+    state_in = State(leader=False, relations={peer})
+
+    with ctx(ctx.on.update_status(), state_in) as mgr:
+        with pytest.raises(ValueError):
+            mgr.charm.restart_manager.request_async_lock(
+                callback_id=callback_id,
+                kwargs=kwargs,
+                max_retry=max_retry,
+            )
 
 
 def test_existing_operation_then_new_request():
@@ -281,7 +318,7 @@ def test_relation_changed_without_grant_does_not_run_operation():
 def test_lock_complete_pops_head():
     ctx = Context(CharmRollingOpsCharm)
     remote_unit_name = f"{ctx.app_name}/1"
-    local_unit_name = f"<ops.model.Unit {ctx.app_name}/0>"
+    local_unit_name = f"{ctx.app_name}/0"
     queue = _make_operation_queue(callback_id="_restart", kwargs={}, max_retry=0)
     peer = PeerRelation(
         endpoint="restart",
@@ -303,11 +340,11 @@ def test_lock_complete_pops_head():
 
 def test_successful_operation_leaves_state_request_when_more_ops_remain():
     ctx = Context(CharmRollingOpsCharm)
-    local_unit_name = f"<ops.model.Unit {ctx.app_name}/0>"
+    local_unit_name = f"{ctx.app_name}/0"
     remote_unit_name = f"{ctx.app_name}/1"
     queue = OperationQueue()
-    queue.enqueue_lock_request(callback_id="_restart", kwargs={}, max_retry=-1)
-    queue.enqueue_lock_request(callback_id="_failed_restart", kwargs={}, max_retry=-1)
+    queue.enqueue_lock_request(callback_id="_restart", kwargs={}, max_retry=None)
+    queue.enqueue_lock_request(callback_id="_failed_restart", kwargs={}, max_retry=None)
 
     peer = PeerRelation(
         endpoint="restart",
@@ -330,7 +367,7 @@ def test_successful_operation_leaves_state_request_when_more_ops_remain():
 def test_lock_retry_marks_retry():
     ctx = Context(CharmRollingOpsCharm)
     remote_unit_name = f"{ctx.app_name}/1"
-    local_unit_name = f"<ops.model.Unit {ctx.app_name}/0>"
+    local_unit_name = f"{ctx.app_name}/0"
     queue = _make_operation_queue(callback_id="_failed_restart", kwargs={}, max_retry=3)
     peer = PeerRelation(
         endpoint="restart",
@@ -359,9 +396,13 @@ def test_lock_retry_marks_retry():
 def test_lock_retry_drops_when_max_retry_reached():
     ctx = Context(CharmRollingOpsCharm)
     remote_unit_name = f"{ctx.app_name}/1"
-    local_unit_name = f"<ops.model.Unit {ctx.app_name}/0>"
+    local_unit_name = f"{ctx.app_name}/0"
     operation = Operation(
-        callback_id="_failed_restart", kwargs={}, max_retry=3, requested_at=_now_timestamp(), attempt=3
+        callback_id="_failed_restart",
+        kwargs={},
+        max_retry=3,
+        requested_at=_now_timestamp(),
+        attempt=3,
     )
     queue = OperationQueue()
     queue._enqueue(operation)
@@ -446,7 +487,7 @@ def test_schedule_picks_oldest_requested_at_among_requests():
 
     state_out = ctx.run(ctx.on.leader_elected(), state_in)
     databag = _app_databag(state_out, peer)
-    remote_unit_name = f"<ops.model.Unit {ctx.app_name}/2>"
+    remote_unit_name = f"{ctx.app_name}/2"
     assert databag["granted_unit"] == remote_unit_name
 
 
@@ -477,7 +518,7 @@ def test_schedule_picks_oldest_executed_at_among_retries_when_no_requests():
     state_out = ctx.run(ctx.on.leader_elected(), state_in)
 
     databag = _app_databag(state_out, peer)
-    remote_unit_name = f"<ops.model.Unit {ctx.app_name}/2>"
+    remote_unit_name = f"{ctx.app_name}/2"
     assert databag["granted_unit"] == remote_unit_name
 
 
@@ -501,7 +542,7 @@ def test_schedule_prioritizes_requests_over_retries():
     state_out = ctx.run(ctx.on.leader_elected(), state_in)
 
     databag = _app_databag(state_out, peer)
-    remote_unit_name = f"<ops.model.Unit {ctx.app_name}/2>"
+    remote_unit_name = f"{ctx.app_name}/2"
     assert databag["granted_unit"] == remote_unit_name
 
 

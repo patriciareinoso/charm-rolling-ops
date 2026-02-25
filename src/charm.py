@@ -28,14 +28,13 @@ logger = logging.getLogger(__name__)
 class CharmRollingOpsCharm(CharmBase):
     """Charm the service."""
 
-    #on = RollingOpsManagerEvents()
     def __init__(self, *args):
         super().__init__(*args)
 
         callback_targets = {"_restart": self._restart, "_failed_restart": self._failed_restart}
 
         self.restart_manager = RollingOpsManagerV1(
-            charm=self, relation="restart", callback_targets=callback_targets
+            charm=self, relation_name="restart", callback_targets=callback_targets
         )
 
         self.framework.observe(self.on.install, self._on_install)
@@ -63,16 +62,16 @@ class CharmRollingOpsCharm(CharmBase):
 
     def _on_restart_action(self, event):
         self.model.unit.status = WaitingStatus("Awaiting _restart operation")
-        self.restart_manager.request_lock(
+        self.restart_manager.request_async_lock(
             callback_id="_restart", kwargs={"delay": event.params.get("delay")}
         )
 
     def _on_failed_restart_action(self, event):
         self.model.unit.status = WaitingStatus("Awaiting _failed_restart operation")
-        self.restart_manager.request_lock(
+        self.restart_manager.request_async_lock(
             callback_id="_failed_restart",
             kwargs={"delay": event.params.get("delay")},
-            max_retry=event.params.get("max_retry"),
+            max_retry=event.params.get("max-retry", None),
         )
 
 

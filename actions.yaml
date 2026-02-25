@@ -19,5 +19,4 @@ failed-restart:
     max-retry:
       description: "Number of times the operation should be retried."
       type: integer
-      default: 1
 
