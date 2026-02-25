@@ -17,6 +17,7 @@
 import asyncio
 import json
 import logging
+import shutil
 import subprocess
 
 import pytest
@@ -42,6 +43,14 @@ def get_restart_type(unit: Unit, model_name: str) -> str:
     ]
 
     return restart_type
+
+
+@pytest.fixture(scope="module", autouse=True)
+def copy_rolling_ops_library_into_charm(ops_test: OpsTest):
+    """Copy the data_interfaces library to the different charm folder."""
+    library_path = "lib/charms/rolling_ops/v0/rollingops.py"
+    install_path = "tests/charms/v0/" + library_path
+    shutil.copyfile(library_path, install_path)
 
 
 @pytest.mark.abort_on_fail

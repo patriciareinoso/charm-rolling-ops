@@ -132,14 +132,13 @@ logger = logging.getLogger(__name__)
 LIBID = "20b7777f58fe421e9a223aefc2b4d3a4"
 
 # Increment this major API version when introducing breaking changes
-LIBAPI = 0
+LIBAPI = 1
 
 # Increment this PATCH version before using `charmcraft publish-lib` or reset
 # to 0 if you are raising the major API version
-LIBPATCH = 8
+LIBPATCH = 0
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S.%fZ"
-LOG_FILE_PATH = "/var/log/cluster_topology_observer.log"
 
 
 def _now_timestamp_str() -> str:
