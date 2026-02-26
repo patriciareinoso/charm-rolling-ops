@@ -12,53 +12,82 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""This library enables "rolling" operations across units of a charmed application using a peer-relation distributed lock.
+"""Rolling Ops v1 — coordinated rolling operations for Juju charms.
 
-This library coordinates rolling operations so that at most one unit executes the operation at a time.
+This library provides a reusable mechanism for coordinating rolling operations
+across units of a Juju application using a peer-relation distributed lock.
 
-For example, a charm author might use this library to implement a "rolling restart", in
-which all units in an application restart their workload, but no two units execute the
-restart at the same time.
+The library guarantees that at most one unit executes a rolling operation at any
+time, while allowing multiple units to enqueue operations and participate
+in a coordinated rollout.
 
-Interface (peer relation):
-- Unit databag keys:
-  - state: "idle" | "request" | "retry"
-  - operations: JSON-encoded list of queued operations (FIFO)
-  - attempt: integer (string) number of attempts for the head operation
-  - executed_at: timestamp string (UTC) when the head operation completed successfully
+## Data model (peer relation)
 
-- App databag keys:
-  - granted_unit: string "<unit-id>" or ""
-  - granted_at: timestamp string (UTC) when the lock was granted
+### Unit databag
 
-Operation queue semantics:
-- Units enqueue operations into instead of overwriting a single pending request.
-- Deduplication: if the last queued operation has the same callback_key and kwargs,
-  the new request is ignored (no-op). Otherwise it is appended.
-- Execution fairness: when granted, a unit executes exactly ONE operation (queue head),
-  then releases the lock to allow other units to run.
+Each unit maintains a FIFO queue of operations it wishes to execute.
 
-Retry semantics:
-- If a unit returns OperationResult.RETRY, it transitions to state="retry", increments attempt,
-  and records executed_at. The head operation remains queued.
-- A max_retries value may be specified per operation. When exceeded, the head operation is
-  dropped and the unit proceeds to attempt to acquire the lock for the next queued operation (if any).
+Keys:
+- `operations`: JSON-encoded list of queued `Operation` objects
+- `state`: `"idle"` | `"request"` | `"retry"`
+- `executed_at`: UTC timestamp string indicating when the current operation last ran
 
-Scheduling:
-- The leader grants the lock when no unit is currently granted.
+Each `Operation` contains:
+- `callback_id`: identifier of the callback to execute
+- `kwargs`: JSON-serializable arguments for the callback
+- `requested_at`: UTC timestamp when the operation was enqueued
+- `max_retry`: maximum retry count (`< 0` means unlimited)
+- `attempt`: current attempt number
+
+### Application databag
+
+The application databag represents the global lock state.
+
+Keys:
+- `granted_unit`: unit identifier (unit name), or empty
+- `granted_at`: UTC timestamp indicating when the lock was granted
+
+## Operation semantics
+
+- Units enqueue operations instead of overwriting a single pending request.
+- Duplicate operations (same `callback_id` and `kwargs`) are ignored if they are
+  already the last queued operation.
+- When granted the lock, a unit executes exactly one operation (the queue head).
+- After execution, the lock is released so that other units may proceed.
+
+## Retry semantics
+
+- If a callback returns `OperationResult.RETRY` or raises an exception, the operation
+  is retried according to its retry policy.
+- Retry state (`attempt`) is tracked per operation.
+- When `max_retry` is exceeded, the failing operation is dropped and the unit
+  proceeds to the next queued operation, if any.
+
+## Deferral semantics
+
+If the unit wants to retry the operation but keep the lock it should defer the
+RunWithLock event. It would be the responsibility of the charm author to make sure
+there are other events triggered on the charm so that the deferred event can be called.
+
+## Scheduling semantics
+
+- Only the leader schedules lock grants.
+- If a valid lock grant exists, no new unit is scheduled.
 - Requests are preferred over retries.
-- Among requests, the oldest enqueued_at is selected.
-- Among retries, the oldest executed_at is selected.
+- Among requests, the operation with the oldest `requested_at` timestamp is selected.
+- Among retries, the operation with the oldest `executed_at` timestamp is selected.
+- Stale grants (e.g., pointing to departed units) are automatically released.
 
-All timestamps are stored in UTC using TIMESTAMP_FORMAT.
+All timestamps are stored in UTC using `TIMESTAMP_FORMAT`.
 
-To implement the rolling restart, a charm author would do the following:
+## Using the library in a charm
 
-1. Add a peer relation called 'restart' to a charm's `metadata.yaml`:
+### 1. Declare a peer relation
+
 ```yaml
 peers:
-    restart:
-        interface: rolling_op
+  restart:
+    interface: rolling_op
 ```
 
 Import this library into src/charm.py, and initialize a RollingOpsManager in the Charm's
@@ -67,41 +96,55 @@ a unit holds the distributed lock:
 
 src/charm.py
 ```python
-# ...
-from charms.rolling_ops.v0.rollingops import RollingOpsManager
-# ...
-class SomeCharm(...):
-    def __init__(...)
-        # ...
-        self.restart_manager = RollingOpsManager(
-            charm=self, relation="restart", callback=self._restart
+from charms.rolling_ops.v1.rollingops import RollingOpsManagerv1, OperationResult, RunWithLock
+
+class SomeCharm(CharmBase):
+    def __init__(self, *args):
+        super().__init__(*args)
+
+        self.rolling_ops = RollingOpsManagerv1(
+            charm=self,
+            relation="restart",
+            callback_targets={
+                "restart": self._restart,
+                "failed_restart": self._failed_restart,
+                "defer_restart": self._defer_restart,
+            },
         )
-        # ...
-    def _restart(self, event):
-        systemd.service_restart('foo')
+
+    def _restart(self, event: RunWithLock, force: bool) -> OperationResult:
+        # perform restart logic
+        return OperationResult.COMPLETED
+
+    def _failed_restart(self, event: RunWithLock) -> OperationResult:
+        # perform restart logic
+        return OperationResult.RETRY
+
+    def _defer_restart(self, event: RunWithLock) -> OperationResult:
+        if not self.ready():
+            event.defer()
+            return OperationResult.RETRY
+        # do restart logic
+        return OperationResult.COMPLETED
 ```
 
-To kick off the rolling restart, emit this library's AcquireLock event. The simplest way
-to do so would be with an action, though it might make sense to acquire the lock in
-response to another event.
+Request a rolling operation
 
 ```python
-    def _on_trigger_restart(self, event):
-        self.charm.on[self.restart_manager.name].acquire_lock.emit()
+
+    def _on_restart_action(self, event):
+        self.rolling_ops.request_async_lock(
+            callback_id="restart",
+            kwargs={"force": True},
+            max_retry=3,
+    )
 ```
 
-In order to trigger the restart, a human operator would execute the following command on
-the CLI:
+All participating units must enqueue the operation in order to be included
+in the rolling execution.
 
-```
-juju run-action some-charm/0 some-charm/1 <... some-charm/n> restart
-```
-
-Note that all units that plan to restart must receive the action and emit the acquire
-event. Any units that do not run their acquire handler will be left out of the rolling
-restart. (An operator might take advantage of this fact to recover from a failed rolling
-operation without restarting workloads that were able to successfully restart -- simply
-omit the successful units from a subsequent run-action call.)
+Units that do not enqueue the operation will be skipped, allowing operators
+to recover from partial failures by reissuing requests selectively.
 """
 
 import argparse
@@ -600,6 +643,14 @@ class RollingOpsLockGrantedEvent(EventBase):
     """Custom event emitted when the background worker grants the lock."""
 
 
+class RunWithLock(EventBase):
+    """Event to signal that this unit should run the callback."""
+
+
+class ProcessLocks(EventBase):
+    """Used to tell the leader to process all locks."""
+
+
 class RollingOpsManagerV1(Object):
     """Emitters and handlers for rolling ops."""
 
@@ -619,6 +670,7 @@ class RollingOpsManagerV1(Object):
         self.worker = RollingOpsAsyncWorker(charm, relation_name=relation_name)
 
         charm.on.define_event("rollingop_lock_granted", RollingOpsLockGrantedEvent)
+        charm.on.define_event("{}_run_with_lock".format(self.relation_name), RunWithLock)
 
         self.framework.observe(
             charm.on[self.relation_name].relation_changed, self._on_relation_changed
@@ -629,6 +681,7 @@ class RollingOpsManagerV1(Object):
         self.framework.observe(charm.on.leader_elected, self._process_locks)
         self.framework.observe(charm.on.rollingop_lock_granted, self._on_rollingop_granted)
         self.framework.observe(charm.on.update_status, self._on_rollingop_granted)
+        self.framework.observe(charm.on[self.relation_name].run_with_lock, self._on_run_with_lock)
 
     @property
     def _relation(self) -> Relation | None:
@@ -640,7 +693,7 @@ class RollingOpsManagerV1(Object):
         logger.info("Received a rolling-op lock granted event.")
         lock = Lock(self)
         if lock.should_run():
-            self._execute_operation()
+            self._charm.on[self.relation_name].run_with_lock.emit()
 
     def _on_relation_departed(self, event: RelationDepartedEvent) -> None:
         """Leader cleanup: if a departing unit was granted, clear the grant.
@@ -663,7 +716,7 @@ class RollingOpsManagerV1(Object):
 
         lock = Lock(self)
         if lock.should_run():
-            self._execute_operation()
+            self._charm.on[self.relation_name].run_with_lock.emit()
 
     def _valid_peer_unit_names(self) -> set[str]:
         """Return all unit names currently participating in the peer relation."""
@@ -741,7 +794,7 @@ class RollingOpsManagerV1(Object):
             if lock.is_retry():
                 self.worker.start()
                 return
-            self._execute_operation()
+            self._charm.on[self.relation_name].run_with_lock.emit()
 
     def request_async_lock(
         self,
@@ -789,7 +842,7 @@ class RollingOpsManagerV1(Object):
             )
             raise e
 
-    def _execute_operation(self):
+    def _on_run_with_lock(self, event: RunWithLock):
         """Execute the current head operation if this unit holds the distributed lock.
 
         - If this unit does not currently hold the lock grant, no operation is run.
@@ -814,10 +867,14 @@ class RollingOpsManagerV1(Object):
             )
 
             try:
-                result = callback(**operation.kwargs)
+                result = callback(event, **operation.kwargs)
             except Exception as e:
                 logger.error("Operation failed: %s: %s", operation.callback_id, e)
                 result = OperationResult.RETRY
+
+            if event.deferred:
+                logger.info("Execution of %s was deferred.", operation.callback_id)
+                return
 
             if result == OperationResult.RETRY:
                 logger.info("Finished %s. Operation will be retried.", operation.callback_id)

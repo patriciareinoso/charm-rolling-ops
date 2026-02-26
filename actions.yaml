@@ -20,3 +20,14 @@ failed-restart:
       description: "Number of times the operation should be retried."
       type: integer
 
+deferred-restart:
+  description: Example restart with a custom callback function. Used in testing
+  params:
+    delay:
+      description: "Introduce an artificial delay (for testing)."
+      type: integer
+      default: 0
+    max-deferred:
+      description: "Number of times the operation should be deferred."
+      type: integer
+
