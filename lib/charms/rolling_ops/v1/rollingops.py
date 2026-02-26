@@ -775,9 +775,6 @@ class RollingOpsManagerV1(Object):
             elif lock.is_waiting_retry():
                 pending_retries.append(lock)
 
-        logger.info(f"pending_requests {pending_requests}")
-        logger.info(f"pending_retries {pending_retries}")
-
         selected = None
         if pending_requests:
             selected = pick_oldest_request(pending_requests)
