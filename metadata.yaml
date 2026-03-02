@@ -18,5 +18,9 @@ maintainers:
   - Canonical Data Platform <data-platform@lists.launchpad.net>
 
 peers:
-    restart:
-        interface: rolling_op
+  restart:
+      interface: rolling_op
+
+requires:
+  etcd:
+    interface: etcd_client
