@@ -21,69 +21,6 @@ from pathlib import Path
 from sys import version_info
 from typing import Any, Optional
 
-# ---------- helpers ----------
-
-def sh(cmd: list[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=check, text=True, capture_output=capture)
-
-def etcdctl(args: list[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
-    return sh(["etcdctl", *args], check=check, capture=capture)
-
-def etcd_get_json(key: str) -> Optional[dict[str, Any]]:
-    res = etcdctl([
-        "get",
-        key,
-        "--print-value-only",
-    ], check=True)
-
-    if not res.stdout.strip():
-        return {}
-
-    out = res.stdout.splitlines()
-    return json.loads(out[0]) if out else None
-
-def etcd_get_first_key(key_prefix: str) -> Optional[str]:
-    res = etcdctl(["get", key_prefix, "--prefix", "--keys-only", "--limit=1"], check=False)
-    if res.returncode != 0:
-        return None
-    out = res.stdout.strip().splitlines()
-    return out[0] if out else None
-
-def etcd_get_last_key(key_prefix: str) -> Optional[str]:
-    res = etcdctl(["get", key_prefix, "--prefix", "--keys-only", "--sort-by=KEY", "--order=DESCEND", "--limit=1"], check=False)
-    if res.returncode != 0:
-        return None
-    out = res.stdout.strip().splitlines()
-    return out[0] if out else None
-
-
-# ---------- key helpers ----------
-TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
-
-
-def _now_timestamp_str() -> str:
-    """UTC timestamp string with microseconds."""
-    return datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT)
-
-
-def _now_timestamp() -> datetime:
-    """UTC timestamp string with microseconds."""
-    return datetime.now(timezone.utc)
-
-
-def _parse_timestamp(timestamp: str) -> Optional[datetime]:
-    """Parse timestamp string. Return 'now' on errors to avoid selecting invalid timestamps."""
-    try:
-        dt = datetime.strptime(timestamp, TIMESTAMP_FORMAT)
-        return dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
-
-
-def _args_to_json(data: dict[str, Any]) -> str:
-    """Deterministic JSON serialization for kwargs."""
-    return json.dumps(data, sort_keys=True, separators=(",", ":"))
-
 @dataclass
 class Operation:
     """A single queued operation."""
@@ -194,24 +131,92 @@ class Operation:
         if not self.max_retry:
             return False
         return self.attempt > self.max_retry
+    
+    @property
+    def op_id(self):
+        return f"{self.requested_at}-{self.callback_id}"
 
 @dataclass(frozen=True)
 class Keys:
-    base: str         # /locks/<cluster_id>/<owner>
-    lock_key: str     # /locks/<cluster_id>/granted-unit
+    base: str         # /rollingops/<owner>
+    lock_key: str     # /rollingops/granted-unit
     pending: str      # <base>/pending/
     inprogress: str   # <base>/inprogress/
-    completed: str    # <base>/completed/
-
-def make_keys(cluster_id: str, owner: str) -> Keys:
-    base = f"/locks/{cluster_id}/{owner}"
+    completed: str    # <base>/comp
+    
+def make_keys(owner: str) -> Keys:
+    base = f"/rollingops/{owner}"
     return Keys(
         base=base,
-        lock_key=f"/locks/{cluster_id}/granted-unit",
+        lock_key=f"/rollingops/granted-unit",
         pending=f"{base}/pending/",
         inprogress=f"{base}/inprogress/",
         completed=f"{base}/completed/",
     )
+
+# ---------- helpers ----------
+
+def sh(cmd: list[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=check, text=True, capture_output=capture)
+
+def etcdctl(args: list[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+    return sh(["etcdctl", *args], check=check, capture=capture)
+
+def etcd_get_json(key: str) -> Optional[dict[str, Any]]:
+    res = etcdctl([
+        "get",
+        key,
+        "--print-value-only",
+    ], check=True)
+
+    if not res.stdout.strip():
+        return {}
+
+    out = res.stdout.splitlines()
+    return json.loads(out[0]) if out else None
+
+def etcd_get_first_key(key_prefix: str) -> Optional[str]:
+    res = etcdctl(["get", key_prefix, "--prefix", "--keys-only", "--limit=1"], check=False)
+    if res.returncode != 0:
+        return None
+    out = res.stdout.strip().splitlines()
+    return out[0] if out else None
+
+def etcd_get_last_key(key_prefix: str) -> Optional[str]:
+    res = etcdctl(["get", key_prefix, "--prefix", "--keys-only", "--sort-by=KEY", "--order=DESCEND", "--limit=1"], check=False)
+    if res.returncode != 0:
+        return None
+    out = res.stdout.strip().splitlines()
+    return out[0] if out else None
+
+
+# ---------- key helpers ----------
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+
+def _now_timestamp_str() -> str:
+    """UTC timestamp string with microseconds."""
+    return datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT)
+
+
+def _now_timestamp() -> datetime:
+    """UTC timestamp string with microseconds."""
+    return datetime.now(timezone.utc)
+
+
+def _parse_timestamp(timestamp: str) -> Optional[datetime]:
+    """Parse timestamp string. Return 'now' on errors to avoid selecting invalid timestamps."""
+    try:
+        dt = datetime.strptime(timestamp, TIMESTAMP_FORMAT)
+        return dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _args_to_json(data: dict[str, Any]) -> str:
+    """Deterministic JSON serialization for kwargs."""
+    return json.dumps(data, sort_keys=True, separators=(",", ":"))
+
 
 def cleanup_completed(keys: Keys, owner: str) -> None:
     completed_key = etcd_get_first_key(keys.completed)
@@ -238,12 +243,13 @@ def move_operation(from_queue: str, to_queue: str, lock_key: str, owner: str) ->
     new_key = f"{to_queue}{opid}"
 
     value = etcd_get_json(head)
+    data = json.dumps(value)
+    value_escaped = data.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
 
     txn = f"""\
-    value("{lock_key}") = "{owner}"
     version("{head}") != "0"
 
-    put "{new_key}" '{value}'
+    put "{new_key}" "{value_escaped}"
     del "{head}"
 
 
@@ -342,13 +348,13 @@ def put_operation(key_prefix: str, operation: Operation):
 
 def main():
     owner = "model.unit1"
-    cluster_id = "cluster1" 
-    keys = make_keys(cluster_id, owner)
+    keys = make_keys( owner)
     operation = Operation.create("restart", {}, 3)
     put_operation(keys.pending, operation)
-    op_id = f"{operation.requested_at}-{operation.callback_id}"
-    key = f"{keys.pending}{op_id}"
-    print(etcd_get_operation(key))
+    move_operation(keys.pending, keys.inprogress, keys.lock_key, owner)
+    #op_id = f"{operation.requested_at}-{operation.callback_id}"
+    #key = f"{keys.pending}{op_id}"
+    #print(etcd_get_operation(key))
 
 
 
@@ -357,12 +363,12 @@ def function2():
     res = etcdctl(["version"])
     print(res.stdout)
 
-    # etcdctl get /locks/cluster1/granted-unit
-    # etcdctl get /locks/cluster1/model.unit1/pending/1-operation
-    # etcdctl put /locks/cluster1/model.unit1/pending/1-operation "1234"
-    # etcdctl get /locks/cluster1/model.unit1/inprogress/1-operation
-    # etcdctl del /locks/cluster1/model.unit1/inprogress/1-operation
-    # etcdctl put /locks/cluster1/model.unit1/completed/1-operation "1234"
+    # etcdctl get /rollingops/cluster1/granted-unit
+    # etcdctl get /rollingops/cluster1/model.unit1/pending/1-operation
+    # etcdctl put /rollingops/cluster1/model.unit1/pending/1-operation "1234"
+    # etcdctl get /rollingops/cluster1/model.unit1/inprogress/1-operation
+    # etcdctl del /rollingops/cluster1/model.unit1/inprogress/1-operation
+    # etcdctl put /rollingops/cluster1/model.unit1/completed/1-operation "1234"
     owner = "model.unit1"
     cluster_id = "cluster1" 
     keys = make_keys(cluster_id, owner)

@@ -265,6 +265,7 @@ class Operation:
             requested_at=_now_timestamp(),
             max_retry=max_retry,
             attempt=0,
+            result=""
         )
 
     def _to_dict(self) -> dict[str, str]:
@@ -277,11 +278,42 @@ class Operation:
             else "",
             "max_retry": str(self.max_retry) if self.max_retry else "",
             "attempt": str(self.attempt),
+            "result" : self.result,
         }
 
     def to_string(self) -> str:
         """Serialize to a string suitable for a Juju databag."""
         return json.dumps(self._to_dict(), separators=(",", ":"))
+    
+    @classmethod
+    def from_dict(cls, data: dict[str, str]) -> "Operation":
+        """Create an Operation from its dict (etcd) representation."""
+        try:
+            requested_at = (
+                datetime.strptime(data["requested_at"], TIMESTAMP_FORMAT)
+                if data.get("requested_at")
+                else None
+            )
+
+            max_retry = (
+                int(data["max_retry"])
+                if data.get("max_retry")
+                else None
+            )
+
+            return cls(
+                callback_id=data["callback_id"],
+                kwargs=json.loads(data["kwargs"]) if data.get("kwargs") else {},
+                requested_at=requested_at,
+                max_retry=max_retry,
+                attempt=int(data["attempt"]),
+                result=data.get("result", ""),
+            )
+
+        except KeyError as e:
+            raise ValueError(f"Missing required field: {e}") from e
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            raise ValueError(f"Invalid Operation dict: {e}") from e
 
     def increase_attempt(self) -> None:
         """Increment the attempt counter."""
@@ -292,30 +324,10 @@ class Operation:
         if not self.max_retry:
             return False
         return self.attempt > self.max_retry
-
-    @classmethod
-    def from_string(cls, data: str) -> "Operation":
-        """Deserialize from a Juju databag string."""
-        obj = json.loads(data)
-        return cls(
-            callback_id=obj["callback_id"],
-            kwargs=json.loads(obj["kwargs"]) if obj.get("kwargs") else {},
-            requested_at=_parse_timestamp(obj["requested_at"])
-            if obj.get("requested_at")
-            else None,
-            max_retry=int(obj["max_retry"]) if obj.get("max_retry") else None,
-            attempt=int(obj["attempt"]),
-        )
-
-    def __eq__(self, other: object) -> bool:
-        """Equal for the operation."""
-        if not isinstance(other, Operation):
-            return NotImplemented
-        return self.callback_id == other.callback_id and self.kwargs == other.kwargs
-
-    def __hash__(self) -> int:
-        """Hash for the operation."""
-        return hash((self.callback_id, _args_to_json(self.kwargs)))
+    
+    @property
+    def op_id(self):
+        return f"{self.requested_at}-{self.callback_id}"
 
 
 class OperationQueue:
@@ -383,6 +395,24 @@ class OperationQueue:
         operations = [Operation.from_string(s) for s in items]
         return cls(operations)
 
+@dataclass(frozen=True)
+class Keys:
+    base: str         # /rollingops/<owner>
+    lock_key: str     # /rollingops/granted-unit
+    pending: str      # <base>/pending/
+    inprogress: str   # <base>/inprogress/
+    completed: str    # <base>/completed/
+
+
+def make_keys(owner: str) -> Keys:
+    base = f"/rollingops/{owner}"
+    return Keys(
+        base=base,
+        lock_key=f"/rollingops/granted-unit",
+        pending=f"{base}/pending/",
+        inprogress=f"{base}/inprogress/",
+        completed=f"{base}/completed/",
+    )
 
 class LockIntent(Enum):
     """Unit-level lock intents stored in unit databags."""
@@ -765,6 +795,101 @@ class EtcdCtl:
     def run(self, args: list[str], check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
         cmd = ["etcdctl", *args]
         return subprocess.run(cmd, env=self._load_env(), check=check, text=True, capture_output=capture)
+    
+    def put_operation(self, key_prefix: str, operation: Operation):
+        op_str = operation.to_string()
+        key = f"{key_prefix}{operation.op_id}"
+        self.run(["put", key, op_str])
+
+    def get_first_key(self, key_prefix: str) -> Optional[str]:
+        res = self.run(["get", key_prefix, "--prefix", "--keys-only", "--limit=1"], check=False)
+        if res.returncode != 0:
+            return None
+        out = res.stdout.strip().splitlines()
+        return out[0] if out else None
+
+    def get_last_key(self, key_prefix: str) -> Optional[str]:
+        res = self.run(["get", key_prefix, "--prefix", "--keys-only", "--sort-by=KEY", "--order=DESCEND", "--limit=1"], check=False)
+        if res.returncode != 0:
+            return None
+        out = res.stdout.strip().splitlines()
+        return out[0] if out else None
+    
+    def get_lease(self, ttl: int) -> str:
+        """ Create a lease and return its ID."""
+        res = self.run(["lease", "grant", str(ttl)])
+        # parse: "lease 694d9c9aeca3422a granted with TTL(1800s)"
+        parts = res.stdout.strip().split()
+        return parts[1]
+    
+    def start_lease_keepalive(self, lease_id: str) -> str:
+        return subprocess.Popen(
+            ["etcdctl", "lease", "keep-alive", lease_id],
+            env=self._load_env(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).pid
+    
+    def sh(self, cmd: list[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+        return subprocess.run(cmd, env=self._load_env(), check=check, text=True, capture_output=capture)
+    
+    def try_acquire_lock(self, keys: Keys, owner: str, lease_id: str) -> bool:
+        txn = f"""\
+        version("{keys.lock_key}") = "0"
+
+        put "{keys.lock_key}" "{owner}" --lease={lease_id}
+
+
+        """
+        res = self.sh(["bash", "-lc", f"printf %s '{txn}' | etcdctl txn"], check=False)
+        return "SUCCESS" in res.stdout
+    
+    def get_json(self, key: str) -> Optional[dict[str, Any]]:
+        res = self.run([
+            "get",
+            key,
+            "--print-value-only",
+        ], check=True)
+
+        if not res.stdout.strip():
+            return {}
+
+        out = res.stdout.splitlines()
+        logger.info(f"DEBUG etcd value: {out}")
+        return json.loads(out[0]) if out else None
+    
+    def get_operation(self, key: str) -> Optional[Operation]:
+        res = self.get_json(key)
+        if not res:
+            return None
+        return Operation.from_dict(res)
+    
+    def move_operation(self, from_queue: str, to_queue: str, lock_key: str, owner: str) -> bool:
+        head = self.get_first_key(from_queue)
+        if not head:
+            return False
+
+        opid = head.split("/")[-1]
+        new_key = f"{to_queue}{opid}"
+        value = self.get_json(head)
+        data = json.dumps(value)
+        value_escaped = data.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+
+        txn = f"""\
+        value("{lock_key}") = "{owner}"
+        version("{head}") != "0"
+
+        put "{new_key}" "{value_escaped}"
+        del "{head}"
+
+
+        """
+        res = self.sh(["bash", "-lc", f"printf %s '{txn}' | etcdctl txn"], check=False)
+        return "SUCCESS" in res.stdout
+
+
 
 class RollingOpsManagerV2(Object):
     """Emitters and handlers for rolling ops."""
@@ -806,6 +931,9 @@ class RollingOpsManagerV2(Object):
         self.framework.observe(self.etcd.on.etcd_ready, self._on_etcd_ready)
 
         self.etcdctl = EtcdCtl()
+        self.owner = f"{self.model.name}-{self.model.unit.name}".replace("/", "-")
+
+        self.keys = make_keys(self.owner)
 
     @property
     def _relation(self) -> Relation | None:
@@ -846,16 +974,14 @@ class RollingOpsManagerV2(Object):
             client_key_path=client_key_path,
             tls=True,
         )
-        self.etcdctl.run(["put", "/rollingops/key", "1234"])
-
 
     def _on_rollingop_granted(self, event: RollingOpsLockGrantedEvent) -> None:
         if not self._relation:
             return
         logger.info("Received a rolling-op lock granted event.")
-        lock = Lock(self)
-        if lock.should_run():
-            self._on_run_with_lock()
+        #lock = Lock(self)
+        #if lock.should_run():
+        self._on_run_with_lock()
 
     def _on_relation_departed(self, event: RelationDepartedEvent) -> None:
         """Leader cleanup: if a departing unit was granted, clear the grant.
@@ -902,11 +1028,14 @@ class RollingOpsManagerV2(Object):
         if callback_id not in self.callback_targets:
             raise ValueError(f"Unknown callback_id: {callback_id}")
 
-        logger.info(f"lock request received")
-        self.etcdctl.run(["put", "/rollingops/key", "12345"])
+        operation = Operation.create(callback_id, kwargs, max_retry)
+        self.etcdctl.put_operation(self.keys.pending, operation)
+
+        self.worker.start()
 
         # self.etcdctl.add_operation_to_pending
         # launch process
+
 
     def _on_run_with_lock(self):
         """Execute the current head operation if this unit holds the distributed lock.
@@ -916,19 +1045,24 @@ class RollingOpsManagerV2(Object):
         - Otherwise, the operation's callback is looked up by `callback_id` and
             invoked with the operation kwargs.
         """
-        lock = Lock(self)
-        if not lock.is_granted():
-            logger.debug("Lock is not granted. Operation will not run.")
+        #lock = Lock(self)
+        #if not lock.is_granted():
+        #    logger.debug("Lock is not granted. Operation will not run.")
+        #    return
+        op_key = self.etcdctl.get_first_key(self.keys.inprogress)
+        if not op_key:
             return
-        operation = lock.get_current_operation()
-        if not operation:
-            logger.debug("There is no operation to run.")
-            lock.complete()
-            return
+        
+        operation = self.etcdctl.get_operation(op_key)
+
+        #if not operation:
+        #    logger.debug("There is no operation to run.")
+        #    lock.complete()
+        #    return
 
         callback = self.callback_targets.get(operation.callback_id, "")
         logger.debug(
-            "Executing callback_id=%s,  attempt=%s", operation.callback_id, operation.attempt
+            "Executing callback_id=%s, attempt=%s", operation.callback_id, operation.attempt
         )
 
         try:
@@ -937,20 +1071,25 @@ class RollingOpsManagerV2(Object):
             logger.error("Operation failed: %s: %s", operation.callback_id, e)
             result = OperationResult.RETRY_RELEASE
 
-        if result == OperationResult.RETRY_HOLD:
+        operation.result = result
+
+        if operation.result == OperationResult.RETRY_HOLD:
             logger.info(
                 "Finished %s. Operation will be retried inmmediately.", operation.callback_id
             )
-            lock.retry_hold()
+            operation.result = OperationResult.RETRY_HOLD
 
-        elif result == OperationResult.RETRY_RELEASE:
+        elif operation.result == OperationResult.RETRY_RELEASE:
             logger.info("Finished %s. Operation will be retried later.", operation.callback_id)
-            lock.retry_release()
+            operation.result = OperationResult.RETRY_RELEASE
+
         else:
             logger.info("Finished %s. Lock will be released.", operation.callback_id)
-            lock.complete()
+            operation.result = OperationResult.RELEASE
         
-        #self.etctl.move_operation_to_completed wihth operation result
+        moved = self.etcdctl.move_operation(self.keys.inprogress, self.keys.completed, op_key, self.owner)
+
+        logger.info(f"moved {moved}")
 
 
 
@@ -964,6 +1103,7 @@ class RollingOpsAsyncWorker(Object):
         self._run_cmd = (
             "/usr/bin/juju-exec" if self.model.juju_version.major > 2 else "/usr/bin/juju-run"
         )
+        self.owner = f"{self.model.name}-{self.model.unit.name}".replace("/", "-")
 
     @property
     def _relation(self):
@@ -997,7 +1137,7 @@ class RollingOpsAsyncWorker(Object):
                 new_env["PYTHONPATH"] = f"{venv_path.resolve()}:{new_env['PYTHONPATH']}"
                 break
 
-        worker = self._charm.charm_dir / "lib/charms/rolling_ops/v1" / "rollingops.py"
+        worker = self._charm.charm_dir / "lib/charms/rolling_ops/v2" / "rollingops.py"
 
         pid = subprocess.Popen(
             [
@@ -1010,10 +1150,12 @@ class RollingOpsAsyncWorker(Object):
                 self._charm.model.unit.name,
                 "--charm-dir",
                 str(self._charm.charm_dir),
+                "--owner",
+                self.owner,
             ],
             cwd=str(self._charm.charm_dir),
             stdout=open("/var/log/rollingops_worker.log", "a"),
-            stderr=subprocess.STDOUT,
+            stderr=open("/var/log/rollingops_worker.err", "a"),
             env=new_env,
         ).pid
 
@@ -1036,6 +1178,11 @@ class RollingOpsAsyncWorker(Object):
             pass
         self._app_data.update({"rollingops-worker-pid": ""})
 
+def stop_keepalive(pid: str) -> None:
+    try:
+        os.kill(pid, signal.SIGINT)
+    except OSError:
+        pass
 
 def main():
     """Juju hook event dispatcher."""
@@ -1043,13 +1190,53 @@ def main():
     parser.add_argument("--run-cmd", required=True)
     parser.add_argument("--unit-name", required=True)
     parser.add_argument("--charm-dir", required=True)
+    parser.add_argument("--owner", required=True)
     args = parser.parse_args()
 
     time.sleep(10)
-    dispatch_sub_cmd = f"JUJU_DISPATCH_PATH=hooks/rollingop_lock_granted {args.charm_dir}/dispatch"
-    res = subprocess.run([args.run_cmd, "-u", args.unit_name, dispatch_sub_cmd])
-    res.check_returncode()
 
+    etcdctl = EtcdCtl()
+    keys = make_keys(args.owner)
+    holding_lock = None
+    lease_id = None
+    lock_lease_ttl=60
+    pid = None
+    acquire_retry_sleep= 30
+
+    
+    while True:
+        pending_key= etcdctl.get_first_key(keys.pending)
+        if not pending_key:
+            time.sleep(acquire_retry_sleep)
+            continue
+            pass
+        if not holding_lock: # check with etcdctl
+
+            if lease_id is None:
+                lease_id = etcdctl.get_lease(lock_lease_ttl)
+                pid = etcdctl.start_lease_keepalive(lease_id)
+
+            if etcdctl.try_acquire_lock(keys, args.owner, lease_id):
+                holding_lock = True
+                print(f"Lock granted {pid}")
+
+            else:
+                attempt += 1
+                time.sleep(acquire_retry_sleep)
+                continue
+
+        moved = etcdctl.move_operation(keys.pending, keys.inprogress, keys.lock_key, args.owner)
+        if moved:
+            # dispatch hook
+            print("dispatch hook")
+            dispatch_sub_cmd = f"JUJU_DISPATCH_PATH=hooks/rollingop_lock_granted {args.charm_dir}/dispatch"
+            res = subprocess.run([args.run_cmd, "-u", args.unit_name, dispatch_sub_cmd])
+            res.check_returncode()
+            break
+        else:
+            time.sleep(acquire_retry_sleep)
+
+    stop_keepalive(pid)
 
 if __name__ == "__main__":
     main()
