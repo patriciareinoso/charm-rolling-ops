@@ -887,9 +887,47 @@ class EtcdCtl:
 
         """
         res = self.sh(["bash", "-lc", f"printf %s '{txn}' | etcdctl txn"], check=False)
+        logger.info(f"txn res {res}")
         return "SUCCESS" in res.stdout
 
+    def watch_queue(self, key_prefix: str):
+        while True:
+            if self.get_first_key(key_prefix):
+                return
+            time.sleep(30)
+    
+    def cleanup_completed(self, keys: Keys, owner: str) -> None:
+        completed_key = self.get_first_key(keys.completed)
+        if not completed_key:
+            return False
 
+        txn = f"""\
+        value("{keys.lock_key}") = "{owner}"
+        version("{completed_key}") != "0"
+
+        del "{completed_key}"
+
+
+        """
+        res = self.sh(["bash", "-lc", f"printf %s '{txn}' | etcdctl txn"], check=False)
+        print(res)
+        return "SUCCESS" in res.stdout
+    
+    def release_lock(self, keys: Keys, owner: str) -> None:
+        self.run(["del", keys.lock_key], check=False)
+
+        txn = f"""\
+        value("{keys.lock_key}") = "{owner}"
+
+        del "{keys.lock_key}"
+
+
+        """
+        res = self.sh(["bash", "-lc", f"printf %s '{txn}' | etcdctl txn"], check=False)
+        return "SUCCESS" in res.stdout
+    
+    def revoke_lease(self, lease_id: str):
+        self.run(["lease", "revoke", lease_id])
 
 class RollingOpsManagerV2(Object):
     """Emitters and handlers for rolling ops."""
@@ -1087,8 +1125,8 @@ class RollingOpsManagerV2(Object):
             logger.info("Finished %s. Lock will be released.", operation.callback_id)
             operation.result = OperationResult.RELEASE
         
-        moved = self.etcdctl.move_operation(self.keys.inprogress, self.keys.completed, op_key, self.owner)
-
+        moved = self.etcdctl.move_operation(self.keys.inprogress, self.keys.completed, self.keys.lock_key, self.owner)
+        ## increase attempt
         logger.info(f"moved {moved}")
 
 
@@ -1209,7 +1247,7 @@ def main():
         if not pending_key:
             time.sleep(acquire_retry_sleep)
             continue
-            pass
+
         if not holding_lock: # check with etcdctl
 
             if lease_id is None:
@@ -1221,7 +1259,6 @@ def main():
                 print(f"Lock granted {pid}")
 
             else:
-                attempt += 1
                 time.sleep(acquire_retry_sleep)
                 continue
 
@@ -1232,11 +1269,30 @@ def main():
             dispatch_sub_cmd = f"JUJU_DISPATCH_PATH=hooks/rollingop_lock_granted {args.charm_dir}/dispatch"
             res = subprocess.run([args.run_cmd, "-u", args.unit_name, dispatch_sub_cmd])
             res.check_returncode()
-            break
         else:
             time.sleep(acquire_retry_sleep)
+            continue
 
-    stop_keepalive(pid)
+        etcdctl.watch_queue(keys.completed)
+        completed_key = etcdctl.get_first_key(keys.completed)
+        operation = etcdctl.get_operation(completed_key)
+        if operation.result == OperationResult.RETRY_HOLD and not operation.is_max_retry_reached():
+            etcdctl.move_operation(keys.completed, keys.pending, keys.lock_key, args.owner)
+            continue
+
+        elif operation.result == OperationResult.RETRY_RELEASE and not operation.is_max_retry_reached():
+            etcdctl.move_operation(keys.completed, keys.pending, keys.lock_key, args.owner)
+
+        else:
+            print(etcdctl.cleanup_completed(keys,  args.owner))
+
+        etcdctl.revoke_lease(lease_id)
+        stop_keepalive(pid)
+        etcdctl.release_lock(keys, args.owner)
+
+        holding_lock = False
+        lease_id = None
+
 
 if __name__ == "__main__":
     main()

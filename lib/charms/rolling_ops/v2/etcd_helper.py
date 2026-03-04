@@ -349,13 +349,13 @@ def put_operation(key_prefix: str, operation: Operation):
 def main():
     owner = "model.unit1"
     keys = make_keys( owner)
-    operation = Operation.create("restart", {}, 3)
-    put_operation(keys.pending, operation)
-    move_operation(keys.pending, keys.inprogress, keys.lock_key, owner)
+    #operation = Operation.create("restart", {}, 3)
+    #put_operation(keys.pending, operation)
+    #move_operation(keys.pending, keys.inprogress, keys.lock_key, owner)
     #op_id = f"{operation.requested_at}-{operation.callback_id}"
     #key = f"{keys.pending}{op_id}"
     #print(etcd_get_operation(key))
-
+    print(watch_queue("locks"))
 
 
 def function2():
