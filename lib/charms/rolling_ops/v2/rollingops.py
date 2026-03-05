@@ -1382,6 +1382,7 @@ def main():
         pending_key= etcdctl.get_first_key(keys.pending)
         if not pending_key:
             break
+        time.sleep(acquire_retry_sleep)
 
 
 if __name__ == "__main__":
