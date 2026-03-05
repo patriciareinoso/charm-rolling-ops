@@ -1,15 +1,4 @@
-import argparse
 import json
-import os
-import subprocess
-import sys
-import time
-from dataclasses import dataclass
-from typing import Any, Optional
-
-import argparse
-import json
-import logging
 import os
 import signal
 import subprocess
@@ -17,9 +6,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
-from sys import version_info
 from typing import Any, Optional
+
 
 @dataclass
 class Operation:
@@ -91,7 +79,7 @@ class Operation:
     def to_string(self) -> str:
         """Serialize to a string suitable for a Juju databag."""
         return json.dumps(self._to_dict(), separators=(",", ":"))
-    
+
     @classmethod
     def from_dict(cls, data: dict[str, str]) -> "Operation":
         """Create an Operation from its dict (etcd) representation."""
@@ -131,10 +119,10 @@ class Operation:
         if not self.max_retry:
             return False
         return self.attempt > self.max_retry
-    
+
     @property
     def op_id(self):
-        return f"{self.requested_at}-{self.callback_id}"
+        return f"{self.requested_at.strftime(TIMESTAMP_FORMAT)}-{self.callback_id}"
 
 @dataclass(frozen=True)
 class Keys:
@@ -143,12 +131,12 @@ class Keys:
     pending: str      # <base>/pending/
     inprogress: str   # <base>/inprogress/
     completed: str    # <base>/comp
-    
+
 def make_keys(owner: str) -> Keys:
     base = f"/rollingops/{owner}"
     return Keys(
         base=base,
-        lock_key=f"/rollingops/granted-unit",
+        lock_key="/rollingops/granted-unit",
         pending=f"{base}/pending/",
         inprogress=f"{base}/inprogress/",
         completed=f"{base}/completed/",
@@ -259,7 +247,7 @@ def move_operation(from_queue: str, to_queue: str, lock_key: str, owner: str) ->
 
 
 def get_lease(ttl: int) -> str:
-    """ Create a lease and return its ID."""
+    """Create a lease and return its ID."""
     res = etcdctl(["lease", "grant", str(ttl)])
     # parse: "lease 694d9c9aeca3422a granted with TTL(1800s)"
     parts = res.stdout.strip().split()
@@ -341,21 +329,50 @@ def finish_execution(keys: Keys, owner: str, lease_id: str, pid: str):
 def put_operation(key_prefix: str, operation: Operation):
 
     op_str = operation.to_string()
-    op_id = f"{operation.requested_at}-{operation.callback_id}"
-    key = f"{key_prefix}{op_id}"
+    key = f"{key_prefix}{operation.op_id}"
     etcdctl(["put", key, op_str])
+
+class OperationResult(Enum):
+    """Callback return values."""
+
+    RELEASE = "release"
+    RETRY_RELEASE = "retry-release"
+    RETRY_HOLD = "retry-hold"
+
+def move_operation_result(from_queue: str, to_queue: str, lock_key: str, owner: str, new_result: OperationResult) -> bool:
+        head = etcd_get_first_key(from_queue)
+        if not head:
+            return False
+
+        op = etcd_get_operation(head)
+        op.result = new_result.value
+        new_key = f"{to_queue}{op.op_id}"
+        data = op.to_string()
+        value_escaped = data.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+
+        txn = f"""\
+        version("{head}") != "0"
+
+        put "{new_key}" "{value_escaped}"
+        del "{head}"
+
+
+        """
+        res = sh(["bash", "-lc", f"printf %s '{txn}' | etcdctl txn"], check=False)
+        print(res)
+        return "SUCCESS" in res.stdout
 
 
 def main():
     owner = "model.unit1"
     keys = make_keys( owner)
-    #operation = Operation.create("restart", {}, 3)
-    #put_operation(keys.pending, operation)
-    #move_operation(keys.pending, keys.inprogress, keys.lock_key, owner)
+    operation = Operation.create("restart", {}, 3)
+    put_operation(keys.pending, operation)
+    move_operation_result(keys.pending, keys.inprogress, keys.lock_key, owner, OperationResult.RETRY_HOLD)
     #op_id = f"{operation.requested_at}-{operation.callback_id}"
     #key = f"{keys.pending}{op_id}"
     #print(etcd_get_operation(key))
-    print(watch_queue("locks"))
+    #print(watch_queue("locks"))
 
 
 def function2():
@@ -370,7 +387,7 @@ def function2():
     # etcdctl del /rollingops/cluster1/model.unit1/inprogress/1-operation
     # etcdctl put /rollingops/cluster1/model.unit1/completed/1-operation "1234"
     owner = "model.unit1"
-    cluster_id = "cluster1" 
+    cluster_id = "cluster1"
     keys = make_keys(cluster_id, owner)
 
     lease_id = None
@@ -401,7 +418,7 @@ def function2():
                 attempt += 1
                 time.sleep(acquire_retry_sleep)
                 continue
-        
+
         moved = move_operation(keys.pending, keys.inprogress, keys.lock_key, owner)
         if moved:
             # dispatch hook
