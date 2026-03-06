@@ -739,7 +739,7 @@ class CertificatesManager:
             - Path to the client private key
         """
         return self.client_certificate, self.client_key
-    
+
     def persist_client_cert_and_key(self, cert_pem: str, key_pem: str) -> None:
         """Persist the provided client certificate and key to disk.
 
@@ -752,6 +752,16 @@ class CertificatesManager:
 
         os.chmod(self.client_certificate, 0o644)
         os.chmod(self.client_key, 0o600)
+
+    def has_client_cert_and_key(self, cert_pem: str, key_pem: str) -> bool:
+        """Return whether the provided certificate material matches local files."""
+        if not self.client_certificate.exists() or not self.client_key.exists():
+            return False
+
+        return (
+            self.client_certificate.read_text() == cert_pem
+            and self.client_key.read_text() == key_pem
+        )
 
     def generate(self, common_name: str) -> None:
         """Generate a client CA and client certificate if they do not exist.
@@ -1250,8 +1260,7 @@ class EtcdOperationQueue:
         self.client.run(["put", key, op_str])
         return True
 
-APP_CERT_KEY = "rollingops-client-cert"
-APP_KEY_KEY = "rollingops-client-key"
+SECRET_FIELD = "rollingops-client-secret-id"
 
 class RollingOpsManagerV2(Object): # handle case relation does not exist
     """Emitters and handlers for rolling ops."""
@@ -1296,6 +1305,8 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
         self.framework.observe(
             charm.on[self.relation_name].relation_changed, self._on_peer_relation_changed
         )
+        self.framework.observe(charm.on.secret_changed, self._on_secret_changed,
+        )
 
         owner = f"{self.model.name}-{self.model.unit.name}".replace("/", "-")
 
@@ -1311,7 +1322,7 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
     def _on_install(self, event) -> None:
         subprocess.run(["apt-get", "update"], check=True)
         subprocess.run(["apt-get", "install", "-y", "etcd-client"], check=True)
-    
+
     def _on_leader_elected(self, event) -> None:
         self._create_and_share_certificate()
 
@@ -1324,7 +1335,7 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
         relation = self.model.get_relation(self.etcd_relation_name)
         if not relation:
             return
-        
+
         if not self._sync_client_certificate():
             logger.warning("Shared rollingops client certificate is not available yet")
             event.defer()
@@ -1347,6 +1358,12 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
             client_key_path=client_key_path,
         )
 
+    def _on_secret_changed(self, event):
+        #if event.secret.label == "rollingops-client-cert":
+        #    self._sync_client_certificate()
+        self._sync_client_certificate()
+
+
     def _on_peer_relation_changed(self, event) -> None:
         """React to peer relation changes.
 
@@ -1363,27 +1380,26 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
         Only the leader generates the certificate and writes it to the peer
         relation application databag.
         """
-        if not self.model.unit.is_leader():
-            return
-
-        if not self.cert_manager.exists():
-            common_name = f"rollingops-{self.model.name}-{self.model.app.name}"
-            self.cert_manager.generate(common_name=common_name)
-
         relation = self._relation
-        if relation is None:
-            logger.debug("Peer relation %s is not available yet", self.relation_name)
+        if relation is None or not self.model.unit.is_leader():
             return
 
         app_data = relation.data[self.model.app]
-        if app_data.get(APP_CERT_KEY) and app_data.get(APP_KEY_KEY):
+        secret_id = app_data.get(SECRET_FIELD)
+
+        if secret_id:
             return
 
+        common_name = f"rollingops-{self.model.name}-{self.model.app.name}"
+        self.cert_manager.generate(common_name)
         cert_pem, key_pem = self.cert_manager.load_client_cert_and_key()
-        app_data[APP_CERT_KEY] = cert_pem
-        app_data[APP_KEY_KEY] = key_pem
 
-        logger.info("Generated and shared rollingops client certificate for app %s", self.model.app.name)
+        secret = self.model.app.add_secret(
+            {"cert": cert_pem, "key": key_pem},
+        )
+        #secret.grant(relation)
+        app_data[SECRET_FIELD] = secret.id
+
 
     def _get_client_certificate_from_peer(self) -> tuple[str, str] | None:
         """Return the client certificate and key from peer app data.
@@ -1395,12 +1411,15 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
         if relation is None:
             return None
 
-        cert_pem = relation.data[self.model.app].get(APP_CERT_KEY, "")
-        key_pem = relation.data[self.model.app].get(APP_KEY_KEY, "")
-        if not cert_pem or not key_pem:
+        secret_id = relation.data[self.model.app].get(SECRET_FIELD)
+        if not secret_id:
             return None
 
-        return cert_pem, key_pem
+        secret = self.model.get_secret(id=secret_id)
+        content = secret.get_content(refresh=True)
+
+        return content["cert"], content["key"]
+
 
     def _sync_client_certificate(self) -> bool:
         """Persist the shared client certificate locally on this unit.
@@ -1415,6 +1434,9 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
             return False
 
         cert_pem, key_pem = shared
+        if self.cert_manager.has_client_cert_and_key(cert_pem, key_pem):
+            return True
+
         self.cert_manager.persist_client_cert_and_key(cert_pem, key_pem)
         return True
 
@@ -1664,7 +1686,7 @@ def main():
                 lease.grant(lock_lease_ttl)
 
             if lock.try_acquire(lease.id):
-                print(f"Lock granted")
+                print("Lock granted")
 
             else:
                 time.sleep(acquire_retry_sleep)
