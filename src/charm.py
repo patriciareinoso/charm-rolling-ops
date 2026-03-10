@@ -48,6 +48,7 @@ class CharmRollingOpsCharm(CharmBase):
         self.framework.observe(self.on.restart_action, self._on_restart_action)
         self.framework.observe(self.on.failed_restart_action, self._on_failed_restart_action)
         self.framework.observe(self.on.deferred_restart_action, self._on_deferred_restart_action)
+        self.framework.observe(self.on.sync_restart_action, self._on_sync_restart_action)
 
     def _restart(self, delay: int = 0):
         # In a production charm, we'd perhaps import the systemd library, and run
@@ -98,6 +99,15 @@ class CharmRollingOpsCharm(CharmBase):
             },
             max_retry=event.params.get("max-retry", None),
         )
+
+    def _on_sync_restart_action(self, event):
+        self.model.unit.status = WaitingStatus("Awaiting _sync_restart operation")
+        timeout = event.params.get("timeout", 60)
+        lease = self.restart_manager.request_sync_lock(timeout=timeout)
+        self.model.unit.status = MaintenanceStatus("Executing _sync_restart operation")
+        time.sleep(int(event.params.get("delay")))
+        self.model.unit.status = ActiveStatus("")
+        self.restart_manager.release_sync_lock(lease)
 
 
 if __name__ == "__main__":

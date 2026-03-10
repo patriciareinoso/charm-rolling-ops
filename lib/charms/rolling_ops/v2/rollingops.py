@@ -151,20 +151,19 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from sys import version_info
 from typing import Any, Optional
 
-from charms.data_platform_libs.v0.data_interfaces import EtcdRequires
-
 from charmlibs.interfaces.tls_certificates import (
-    generate_certificate,
     generate_ca,
+    generate_certificate,
     generate_csr,
     generate_private_key,
 )
+from charms.data_platform_libs.v0.data_interfaces import EtcdRequires
 from ops import Relation
 from ops.charm import (
     CharmBase,
@@ -1523,7 +1522,7 @@ class RollingOpsManagerV2(Object):  # handle case relation does not exist
         """
         if callback_id not in self.callback_targets:
             raise ValueError(f"Unknown callback_id: {callback_id}")
-        
+
         etcd_relation = self.model.get_relation(self.etcd_relation_name)
         if not etcd_relation:
             raise LockNoRelationError
