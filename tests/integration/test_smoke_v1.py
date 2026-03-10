@@ -122,7 +122,7 @@ async def test_dedupe_when_other_unit_holds_lock(ops_test: OpsTest):
         lambda: unit_a.workload_status == "maintenance",
         timeout=30,
     )
-    logger.info(f"Succesive lock request on {unit_b}.")
+    logger.info(f"Successive lock request on {unit_b}.")
     for _ in range(3):
         await unit_b.run_action("restart", delay=0)
         await asyncio.sleep(5)

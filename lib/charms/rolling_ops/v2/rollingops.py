@@ -60,7 +60,7 @@ Keys:
 - If a callback returns `OperationResult.RETRY_RELEASE` the unit will release the
 lock and retry the operation later.
 - If a callback return `OperationResult.RETRY_HOLD` the unit will keep the
-lock and retry inmediately.
+lock and retry immediately.
 - Retry state (`attempt`) is tracked per operation.
 - When `max_retry` is exceeded, the failing operation is dropped and the unit
   proceeds to the next queued operation, if any.
@@ -151,16 +151,17 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 from pathlib import Path
 from sys import version_info
 from typing import Any, Optional
 
 from charms.data_platform_libs.v0.data_interfaces import EtcdRequires
-from charms.tls_certificates_interface.v3.tls_certificates import (
-    generate_ca,
+
+from charmlibs.interfaces.tls_certificates import (
     generate_certificate,
+    generate_ca,
     generate_csr,
     generate_private_key,
 )
@@ -170,6 +171,7 @@ from ops.charm import (
     RelationDepartedEvent,
 )
 from ops.framework import EventBase, Object
+from tenacity import retry, stop_after_delay, wait_fixed
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +267,7 @@ class Operation:
             requested_at=_now_timestamp(),
             max_retry=max_retry,
             attempt=0,
-            result=""
+            result="",
         )
 
     def _to_dict(self) -> dict[str, str]:
@@ -278,7 +280,7 @@ class Operation:
             else "",
             "max_retry": str(self.max_retry) if self.max_retry else "",
             "attempt": str(self.attempt),
-            "result" : self.result,
+            "result": self.result,
         }
 
     def to_string(self) -> str:
@@ -295,11 +297,7 @@ class Operation:
                 else None
             )
 
-            max_retry = (
-                int(data["max_retry"])
-                if data.get("max_retry")
-                else None
-            )
+            max_retry = int(data["max_retry"]) if data.get("max_retry") else None
 
             return cls(
                 callback_id=data["callback_id"],
@@ -326,10 +324,12 @@ class Operation:
         return self.attempt > self.max_retry
 
     def complete(self) -> None:
+        """Mark the operation as completed to indicate the lock should be released."""
         self.increase_attempt()
         self.result = OperationResult.RELEASE.value
 
     def retry_release(self) -> None:
+        """Mark the operation for retry if it has not reached the max retry."""
         self.increase_attempt()
         if self.is_max_retry_reached():
             self.result = OperationResult.RELEASE.value
@@ -337,6 +337,7 @@ class Operation:
             self.result = OperationResult.RETRY_RELEASE.value
 
     def retry_hold(self) -> None:
+        """Mark the operation for retry if it has not reached the max retry."""
         self.increase_attempt()
         if self.is_max_retry_reached():
             self.result = OperationResult.RELEASE.value
@@ -345,6 +346,7 @@ class Operation:
 
     @property
     def op_id(self):
+        """Return the unique identifier for this operation."""
         return f"{self.requested_at.strftime(TIMESTAMP_FORMAT)}-{self.callback_id}"
 
     def __eq__(self, other: object) -> bool:
@@ -423,6 +425,7 @@ class OperationQueue:
         operations = [Operation.from_string(s) for s in items]
         return cls(operations)
 
+
 @dataclass(frozen=True)
 class Keys:
     """Collection of etcd key prefixes used for rolling operations.
@@ -435,26 +438,31 @@ class Keys:
     Attributes:
         base: Root prefix for all queues owned by a specific unit.
         lock_key: Global key used to represent the distributed lock owner.
-        pending: Prefix for operations waiting to acquire the lock.
-        inprogress: Prefix for operations currently being executed.
-        completed: Prefix for operations that have finished execution.
     """
-    base: str         # /rollingops/<owner>
-    lock_key: str     # /rollingops/granted-unit
-    pending: str      # <base>/pending/
-    inprogress: str   # <base>/inprogress/
-    completed: str    # <base>/completed/
 
+    base: str
+    lock_key: str = "/rollingops/granted-unit"
 
-def make_keys(owner: str) -> Keys:
-    base = f"/rollingops/{owner}"
-    return Keys(
-        base=base,
-        lock_key="/rollingops/granted-unit",
-        pending=f"{base}/pending/",
-        inprogress=f"{base}/inprogress/",
-        completed=f"{base}/completed/",
-    )
+    @property
+    def pending(self) -> str:
+        """Prefix for operations waiting to be executed."""
+        return f"{self.base}/pending/"
+
+    @property
+    def inprogress(self) -> str:
+        """Prefix for operations currently being executed."""
+        return f"{self.base}/inprogress/"
+
+    @property
+    def completed(self) -> str:
+        """Prefix for operations that have finished execution."""
+        return f"{self.base}/completed/"
+
+    @classmethod
+    def for_owner(cls, owner: str) -> "Keys":
+        """Create a set of keys for a given owner."""
+        return cls(base=f"/rollingops/{owner}")
+
 
 class LockIntent(Enum):
     """Unit-level lock intents stored in unit databags."""
@@ -677,6 +685,7 @@ class Locks:
         for unit in self._units:
             yield Lock(self._manager, unit=unit)
 
+
 class RollingOpsLockGrantedEvent(EventBase):
     """Custom event emitted when the background worker grants the lock."""
 
@@ -782,34 +791,33 @@ class CertificatesManager:
         if self.exists():
             return
 
-        ca_key_pem = generate_private_key(key_size=4096)
-        ca_crt_pem = generate_ca(
-            private_key=ca_key_pem,
-            subject="rollingops-client-ca",
-            validity=self.validity_days,
+        ca_key = generate_private_key(key_size=4096)
+        ca_crt = generate_ca(
+            private_key=ca_key,
+            common_name="rollingops-client-ca",
+            validity=timedelta(days=self.validity_days),
         )
 
-        client_key_pem = generate_private_key(key_size=4096)
+        client_key = generate_private_key(key_size=4096)
 
-        csr_pem = generate_csr(
-            private_key=client_key_pem,
-            subject=common_name,
+        csr = generate_csr(
+            private_key=client_key,
+            common_name=common_name,
             add_unique_id_to_subject_name=False,
         )
 
-        client_crt_pem = generate_certificate(
-            csr=csr_pem,
-            ca=ca_crt_pem,
-            ca_key=ca_key_pem,
-            validity=self.validity_days,
-            alt_names=None,
+        client_crt = generate_certificate(
+            csr=csr,
+            ca=ca_crt,
+            ca_private_key=ca_key,
+            validity=timedelta(days=self.validity_days),
             is_ca=False,
         )
 
-        self.ca_key.write_bytes(ca_key_pem)
-        self.ca_certificate.write_bytes(ca_crt_pem)
-        self.client_key.write_bytes(client_key_pem)
-        self.client_certificate.write_bytes(client_crt_pem)
+        self.ca_key.write_text(ca_key.raw)
+        self.ca_certificate.write_text(ca_crt.raw)
+        self.client_key.write_text(client_key.raw)
+        self.client_certificate.write_text(client_crt.raw)
 
         os.chmod(self.ca_key, 0o600)
         os.chmod(self.client_key, 0o600)
@@ -824,19 +832,15 @@ class EtcdCtl:
     the environment variables required for connecting to an etcd cluster,
     including TLS configuration, and provides convenience methods for
     executing commands and retrieving structured results.
-
-    Args:
-        base_dir: Directory where the etcdctl environment file will be stored.
     """
 
-    def __init__(self, base_dir: str = "/var/lib/rollingops/etcd"):
-        self.base = Path(base_dir)
-        self.base.mkdir(parents=True, exist_ok=True)
-        self.server_ca = self.base / "server-ca.pem"
-        self.env_file = self.base / "etcdctl.env"
+    BASE_DIR = Path("/var/lib/rollingops/etcd")
+    SERVER_CA = BASE_DIR / "server-ca.pem"
+    ENV_FILE = BASE_DIR / "etcdctl.env"
 
+    @classmethod
     def write_env_file(
-        self,
+        cls,
         endpoints: str,
         tls_ca_pem: str,
         client_cert_path: Path,
@@ -853,22 +857,24 @@ class EtcdCtl:
             client_cert_path: Path to the client TLS certificate.
             client_key_path: Path to the client TLS private key.
         """
-        self.server_ca.write_text(tls_ca_pem or "")
-        os.chmod(self.server_ca, 0o644)
+        cls.BASE_DIR.mkdir(parents=True, exist_ok=True)
+        cls.SERVER_CA.write_text(tls_ca_pem or "")
+        os.chmod(cls.SERVER_CA, 0o644)
 
         lines = [
             'export ETCDCTL_API="3"',
             f'export ETCDCTL_ENDPOINTS="{endpoints}"',
-            f'export ETCDCTL_CACERT="{self.server_ca}"',
+            f'export ETCDCTL_CACERT="{cls.SERVER_CA}"',
             f'export ETCDCTL_CERT="{client_cert_path}"',
             f'export ETCDCTL_KEY="{client_key_path}"',
-            ""
+            "",
         ]
 
-        self.env_file.write_text("\n".join(lines))
-        os.chmod(self.env_file, 0o600)
+        cls.ENV_FILE.write_text("\n".join(lines))
+        os.chmod(cls.ENV_FILE, 0o600)
 
-    def load_env(self) -> dict[str, str]:
+    @classmethod
+    def load_env(cls) -> dict[str, str]:
         """Load etcdctl environment variables from the env file.
 
         Parses the generated environment file and extracts ETCDCTL_*
@@ -881,23 +887,19 @@ class EtcdCtl:
         Raises:
             RuntimeError: If the environment file does not exist.
         """
-        if not self.env_file.exists():
-            raise RuntimeError(f"etcdctl env file does not exist: {self.env_file}")
+        cls.ensure_initialized()
 
         env = os.environ.copy()
 
-        for line in self.env_file.read_text().splitlines():
+        for line in cls.ENV_FILE.read_text().splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
 
             if line.startswith("export "):
-                line = line[len("export "):].strip()
+                line = line[len("export ") :].strip()
 
             if not line.startswith("ETCDCTL_"):
-                continue
-
-            if "=" not in line:
                 continue
 
             key, value = line.split("=", 1)
@@ -906,7 +908,16 @@ class EtcdCtl:
         env.setdefault("ETCDCTL_API", "3")
         return env
 
-    def run(self, args: list[str], check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+    @classmethod
+    def ensure_initialized(cls):
+        """Checks whether the environment file for etcdctl is setup."""
+        if not cls.ENV_FILE.exists():
+            raise RuntimeError(f"etcdctl env file does not exist: {cls.ENV_FILE}")
+
+    @classmethod
+    def run(
+        cls, args: list[str], check: bool = True, capture: bool = True
+    ) -> subprocess.CompletedProcess:
         """Execute an etcdctl command.
 
         Args:
@@ -917,10 +928,14 @@ class EtcdCtl:
         Returns:
             A CompletedProcess object containing the result.
         """
+        cls.ensure_initialized()
         cmd = ["etcdctl", *args]
-        return subprocess.run(cmd, env=self.load_env(), check=check, text=True, capture_output=capture)
+        return subprocess.run(
+            cmd, env=cls.load_env(), check=check, text=True, capture_output=capture
+        )
 
-    def get_first_key_value(self, key_prefix: str) -> Optional[tuple[str, dict]]:
+    @classmethod
+    def get_first_key_value(cls, key_prefix: str) -> Optional[tuple[str, dict]]:
         """Retrieve the first key and value under a given prefix.
 
         Args:
@@ -933,7 +948,7 @@ class EtcdCtl:
 
             Returns None if no key exists or the command fails.
         """
-        res = self.run(
+        res = cls.run(
             ["get", key_prefix, "--prefix", "--limit=1"],
             check=False,
         )
@@ -945,11 +960,10 @@ class EtcdCtl:
         if len(out) < 2:
             return None
 
-        key = out[0]
-        value = json.loads(out[1])
-        return key, value
+        return out[0], json.loads(out[1])
 
-    def get_last_key_value(self, key_prefix: str) -> Optional[tuple[str, dict]]:
+    @classmethod
+    def get_last_key_value(cls, key_prefix: str) -> Optional[tuple[str, dict]]:
         """Retrieve the last key and value under a given prefix.
 
         Args:
@@ -962,18 +976,20 @@ class EtcdCtl:
 
             Returns None if no key exists or the command fails.
         """
-        res = self.run(["get", key_prefix, "--prefix", "--sort-by=KEY", "--order=DESCEND", "--limit=1"], check=False)
+        res = cls.run(
+            ["get", key_prefix, "--prefix", "--sort-by=KEY", "--order=DESCEND", "--limit=1"],
+            check=False,
+        )
         if res.returncode != 0:
             return None
         out = res.stdout.strip().splitlines()
         if len(out) < 2:
             return None
 
-        key = out[0]
-        value = json.loads(out[1])
-        return key, value
+        return out[0], json.loads(out[1])
 
-    def txn(self, txn: str) -> bool: # can be improved?
+    @classmethod
+    def txn(cls, txn: str) -> bool:
         """Execute an etcd transaction.
 
         The transaction string should follow the etcdctl transaction format
@@ -985,18 +1001,23 @@ class EtcdCtl:
         Returns:
             True if the transaction succeeded, otherwise False.
         """
-        res = self._sh(["bash", "-lc", f"printf %s '{txn}' | etcdctl txn"], check=False)
-        logger.info("txn res %s", res)
+        cls.ensure_initialized()
+        res = subprocess.run(
+            ["bash", "-lc", f"printf %s '{txn}' | etcdctl txn"],
+            text=True,
+            env=cls.load_env(),
+            capture_output=True,
+            check=False,
+        )
+
+        logger.debug("etcd txn result: %s", res.stdout)
         return "SUCCESS" in res.stdout
 
-    def _sh(self, cmd: list[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
-        """Execute an arbitrary shell command using the etcdctl environment."""
-        return subprocess.run(cmd, env=self.load_env(), check=check, text=True, capture_output=capture)
 
 class EtcdLease:
     """Manage the lifecycle of an etcd lease and its keep-alive process."""
+
     def __init__(self):
-        self.client = EtcdCtl()
         self.id: str | None = None
         self.keepalive_proc: subprocess.Popen | None = None
 
@@ -1006,7 +1027,7 @@ class EtcdLease:
         Args:
             ttl: Time-to-live of the lease in seconds.
         """
-        res = self.client.run(["lease", "grant", str(ttl)])
+        res = EtcdCtl.run(["lease", "grant", str(ttl)])
         # parse: "lease 694d9c9aeca3422a granted with TTL(1800s)"
         parts = res.stdout.strip().split()
         self.id = parts[1]
@@ -1015,15 +1036,16 @@ class EtcdLease:
     def revoke(self) -> None:
         """Revoke the current lease and stop the keep-alive process."""
         if self.id is not None:
-            self.client.run(["lease", "revoke", self.id])
+            EtcdCtl.run(["lease", "revoke", self.id])
             self.id = None
         self._stop_keepalive()
 
     def _start_lease_keepalive(self) -> None:
         """Start the background process that keeps the lease alive."""
+        EtcdCtl.ensure_initialized()
         self.keepalive_proc = subprocess.Popen(
             ["etcdctl", "lease", "keep-alive", self.id],
-            env=self.client.load_env(),
+            env=EtcdCtl.load_env(),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1042,19 +1064,20 @@ class EtcdLease:
             self.keepalive_proc.wait(timeout=2)
         self.keepalive_proc = None
 
+
 class EtcdLock:
     """Distributed lock implementation backed by etcd.
 
     The lock is represented by a key whose value identifies the current owner.
 
-    Lock acquisition and release are performed usin transactions to
+    Lock acquisition and release are performed using transactions to
     ensure atomicity.
 
     The lock is attached to an etcd lease so that it is
     automatically released if the owner stops refreshing the lease.
     """
+
     def __init__(self, lock_key: str, owner: str):
-        self.client = EtcdCtl()
         self.lock_key = lock_key
         self.owner = owner
 
@@ -1078,7 +1101,7 @@ class EtcdLock:
 
 
         """
-        return self.client.txn(txn)
+        return EtcdCtl.txn(txn)
 
     def release(self) -> None:
         """Release the lock if it is currently held by this owner.
@@ -1094,17 +1117,18 @@ class EtcdLock:
 
 
         """
-        self.client.txn(txn)
+        EtcdCtl.txn(txn)
 
     def is_held(self) -> bool:
         """Check whether the lock is currently held by this owner."""
-        proc = self.client.run(["get", self.lock_key, "--print-value-only"], check=False)
+        proc = EtcdCtl.run(["get", self.lock_key, "--print-value-only"], check=False)
 
         if proc.returncode != 0:
             return False
 
         value = proc.stdout.strip()
         return value == self.owner
+
 
 class EtcdOperationQueue:
     """Queue abstraction for operations stored in etcd.
@@ -1114,15 +1138,14 @@ class EtcdOperationQueue:
     where the key encodes the operation identifier and ordering, and
     the value contains the serialized operation data.
     """
+
     def __init__(self, prefix: str, lock: EtcdLock):
         self.prefix = prefix
-        self.client = EtcdCtl()
         self.lock = lock
 
-
-    def peek(self)-> Optional[Operation]:
+    def peek(self) -> Optional[Operation]:
         """Return the first operation in the queue without removing it."""
-        kv = self.client.get_first_key_value(self.prefix)
+        kv = EtcdCtl.get_first_key_value(self.prefix)
         if not kv:
             return None
         _, value = kv
@@ -1130,7 +1153,7 @@ class EtcdOperationQueue:
 
     def _peek_last(self) -> Optional[Operation]:
         """Return the last operation in the queue without removing it."""
-        kv = self.client.get_last_key_value(self.prefix)
+        kv = EtcdCtl.get_last_key_value(self.prefix)
         if not kv:
             return None
         _, value = kv
@@ -1150,7 +1173,7 @@ class EtcdOperationQueue:
         Returns:
             True if the operation was moved successfully, otherwise False.
         """
-        kv = self.client.get_first_key_value(self.prefix)
+        kv = EtcdCtl.get_first_key_value(self.prefix)
         if not kv:
             return None
         key, value = kv
@@ -1158,7 +1181,7 @@ class EtcdOperationQueue:
         op_id = key.split("/")[-1]
         new_key = f"{to_queue_prefix}{op_id}"
         data = json.dumps(value)
-        value_escaped = data.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+        value_escaped = data.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
         txn = f"""\
         value("{self.lock.lock_key}") = "{self.lock.owner}"
@@ -1169,7 +1192,7 @@ class EtcdOperationQueue:
 
 
         """
-        return self.client.txn(txn)
+        return EtcdCtl.txn(txn)
 
     def move_operation(self, to_queue_prefix: str, operation: Operation) -> bool:
         """Move a specific operation from this queue to another queue.
@@ -1188,7 +1211,7 @@ class EtcdOperationQueue:
         new_key = f"{to_queue_prefix}{operation.op_id}"
 
         data = operation.to_string()
-        value_escaped = data.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+        value_escaped = data.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
         txn = f"""\
         value("{self.lock.lock_key}") = "{self.lock.owner}"
@@ -1199,7 +1222,7 @@ class EtcdOperationQueue:
 
 
         """
-        return self.client.txn(txn)
+        return EtcdCtl.txn(txn)
 
     def watch(self) -> None:
         """Block until at least one operation exists in the queue.
@@ -1208,7 +1231,7 @@ class EtcdOperationQueue:
         an operation is detected
         """
         while True:
-            if self.client.get_first_key_value(self.prefix):
+            if EtcdCtl.get_first_key_value(self.prefix):
                 return
             time.sleep(30)
 
@@ -1221,7 +1244,7 @@ class EtcdOperationQueue:
         Returns:
             True if the operation was removed successfully, otherwise False.
         """
-        kv = self.client.get_first_key_value(self.prefix)
+        kv = EtcdCtl.get_first_key_value(self.prefix)
         if not kv:
             return False
         key, _ = kv
@@ -1234,8 +1257,7 @@ class EtcdOperationQueue:
 
 
         """
-        return self.client.txn(txn)
-
+        return EtcdCtl.txn(txn)
 
     def enqueue(self, operation: Operation) -> bool:
         """Insert a new operation into the queue.
@@ -1257,15 +1279,23 @@ class EtcdOperationQueue:
 
         op_str = operation.to_string()
         key = f"{self.prefix}{operation.op_id}"
-        self.client.run(["put", key, op_str])
+        EtcdCtl.run(["put", key, op_str])
         return True
+
 
 SECRET_FIELD = "rollingops-client-secret-id"
 
-class RollingOpsManagerV2(Object): # handle case relation does not exist
+
+class RollingOpsManagerV2(Object):  # handle case relation does not exist
     """Emitters and handlers for rolling ops."""
 
-    def __init__(self, charm: CharmBase, peer_relation: str, etcd_relation: str, callback_targets: dict[str, Any]):
+    def __init__(
+        self,
+        charm: CharmBase,
+        peer_relation: str,
+        etcd_relation: str,
+        callback_targets: dict[str, Any],
+    ):
         """Register our custom events.
 
         params:
@@ -1305,12 +1335,14 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
         self.framework.observe(
             charm.on[self.relation_name].relation_changed, self._on_peer_relation_changed
         )
-        self.framework.observe(charm.on.secret_changed, self._on_secret_changed,
+        self.framework.observe(
+            charm.on.secret_changed,
+            self._on_secret_changed,
         )
 
         owner = f"{self.model.name}-{self.model.unit.name}".replace("/", "-")
 
-        self.keys = make_keys(owner)
+        self.keys = Keys.for_owner(owner)
         self.lock = EtcdLock(self.keys.lock_key, owner)
         self.pending_queue = EtcdOperationQueue(self.keys.pending, self.lock)
         self.inprogress_queue = EtcdOperationQueue(self.keys.inprogress, self.lock)
@@ -1350,8 +1382,7 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
 
         client_cert_path, client_key_path = self.cert_manager.client_paths()
 
-        etcdctl = EtcdCtl()
-        etcdctl.write_env_file(
+        EtcdCtl.write_env_file(
             endpoints=endpoints,
             tls_ca_pem=tls_ca or "",
             client_cert_path=client_cert_path,
@@ -1359,10 +1390,9 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
         )
 
     def _on_secret_changed(self, event):
-        #if event.secret.label == "rollingops-client-cert":
+        # if event.secret.label == "rollingops-client-cert":
         #    self._sync_client_certificate()
         self._sync_client_certificate()
-
 
     def _on_peer_relation_changed(self, event) -> None:
         """React to peer relation changes.
@@ -1372,7 +1402,6 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
         """
         self._create_and_share_certificate()
         self._sync_client_certificate()
-
 
     def _create_and_share_certificate(self) -> None:
         """Ensure the application client certificate exists.
@@ -1397,9 +1426,7 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
         secret = self.model.app.add_secret(
             {"cert": cert_pem, "key": key_pem},
         )
-        #secret.grant(relation)
         app_data[SECRET_FIELD] = secret.id
-
 
     def _get_client_certificate_from_peer(self) -> tuple[str, str] | None:
         """Return the client certificate and key from peer app data.
@@ -1419,7 +1446,6 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
         content = secret.get_content(refresh=True)
 
         return content["cert"], content["key"]
-
 
     def _sync_client_certificate(self) -> bool:
         """Persist the shared client certificate locally on this unit.
@@ -1443,10 +1469,17 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
     def _on_rollingop_granted(self, event: RollingOpsLockGrantedEvent) -> None:
         if not self._relation:
             return
+        etcd_relation = self.model.get_relation(self.etcd_relation_name)
+        if not etcd_relation:
+            return
+        try:
+            EtcdCtl.ensure_initialized()
+        except RuntimeError:
+            return
         logger.info("Received a rolling-op lock granted event.")
         self._on_run_with_lock()
 
-    def _on_relation_departed(self, event: RelationDepartedEvent) -> None: # check
+    def _on_relation_departed(self, event: RelationDepartedEvent) -> None:  # check
         """Leader cleanup: if a departing unit was granted, clear the grant.
 
         This prevents deadlocks when the granted unit leaves the relation.
@@ -1458,7 +1491,6 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
             if lock.is_granted():
                 lock.release()
                 self._process_locks()
-
 
     def request_async_lock(
         self,
@@ -1486,10 +1518,19 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
                 - 0: do not retry on failure
 
         Raises:
-            ValueError: If the callback_id is not registered.
+            ValueError: If the callback_id is not registered or invalid parameters
+            LockNoRelationError: if the etcd relation does not exist or etcdctl is not configured
         """
         if callback_id not in self.callback_targets:
             raise ValueError(f"Unknown callback_id: {callback_id}")
+        
+        etcd_relation = self.model.get_relation(self.etcd_relation_name)
+        if not etcd_relation:
+            raise LockNoRelationError
+        try:
+            EtcdCtl.ensure_initialized()
+        except RuntimeError:
+            raise LockNoRelationError
 
         operation = Operation.create(callback_id, kwargs, max_retry)
         res = self.pending_queue.enqueue(operation)
@@ -1499,6 +1540,34 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
         else:
             logger.info(f"Operation {operation.callback_id} already exists in the queue.")
 
+    def request_sync_lock(self, timeout: int) -> EtcdLease | None:
+        """Try to acquire the lock until timeout expires.
+
+        Args:
+            timeout: Maximum time in seconds to wait for the lock.
+
+        Returns:
+            The granted lease if the lock was acquired, otherwise None.
+        """
+        lease = EtcdLease()
+        lease.grant(60)
+
+        @retry(stop=stop_after_delay(timeout), wait=wait_fixed(30), reraise=True)
+        def acquire():
+            if not self.lock.try_acquire(lease.id):
+                raise RuntimeError("Lock not acquired.")
+
+        try:
+            acquire()
+            return lease
+        except RuntimeError:
+            lease.revoke()
+            return None
+
+    def release_sync_lock(self, lease: EtcdLease) -> None:
+        """Release the lock and revoke the associated lease."""
+        self.lock.release()
+        lease.revoke()
 
     def _on_run_with_lock(self) -> None:
         """Execute the current operation while holding the distributed lock.
@@ -1532,7 +1601,7 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
 
         if result == OperationResult.RETRY_HOLD:
             logger.info(
-                "Finished %s. Operation will be retried inmmediately.", operation.callback_id
+                "Finished %s. Operation will be retried immediately.", operation.callback_id
             )
             operation.retry_hold()
 
@@ -1546,7 +1615,6 @@ class RollingOpsManagerV2(Object): # handle case relation does not exist
 
         moved = self.inprogress_queue.move_operation(self.keys.completed, operation)
         logger.info(f"moved {moved}")
-
 
 
 class RollingOpsAsyncWorker(Object):
@@ -1566,15 +1634,15 @@ class RollingOpsAsyncWorker(Object):
         return self._charm.model.get_relation(self._peers_name)
 
     @property
-    def _app_data(self):
-        return self._relation.data[self.model.app]
+    def _unit_data(self):
+        return self._relation.data[self.model.unit]
 
     def start(self) -> None:
         """Start a new worker process."""
         if self._relation is None:
             return
 
-        pid_str = self._app_data.get("rollingops-worker-pid", "")
+        pid_str = self._unit_data.get("rollingops-worker-pid", "")
         if pid_str:
             try:
                 pid = int(pid_str)
@@ -1582,7 +1650,9 @@ class RollingOpsAsyncWorker(Object):
                 pid = -1
 
             if self._is_pid_alive(pid):
-                logger.info("RollingOps worker already running with PID %s; not starting a new one.", pid)
+                logger.info(
+                    "RollingOps worker already running with PID %s; not starting a new one.", pid
+                )
                 return
 
         # Remove JUJU_CONTEXT_ID so juju-run works from the spawned process
@@ -1625,7 +1695,7 @@ class RollingOpsAsyncWorker(Object):
             env=new_env,
         ).pid
 
-        self._app_data.update({"rollingops-worker-pid": str(pid)})
+        self._unit_data.update({"rollingops-worker-pid": str(pid)})
         logger.info("Started RollingOps worker process with PID %s", pid)
 
     def _is_pid_alive(self, pid: int) -> bool:
@@ -1643,7 +1713,7 @@ class RollingOpsAsyncWorker(Object):
         """Stop the running worker process if it exists."""
         if self._relation is None:
             return
-        pid_str = self._app_data.get("rollingops-worker-pid", "")
+        pid_str = self._unit_data.get("rollingops-worker-pid", "")
         if not pid_str:
             return
 
@@ -1653,7 +1723,8 @@ class RollingOpsAsyncWorker(Object):
             logger.info("Stopped RollingOps worker process PID %s", pid)
         except OSError:
             pass
-        self._app_data.update({"rollingops-worker-pid": ""})
+        self._unit_data.update({"rollingops-worker-pid": ""})
+
 
 def main():
     """Juju hook event dispatcher."""
@@ -1666,14 +1737,13 @@ def main():
 
     time.sleep(10)
 
-    keys = make_keys(args.owner)
-    lock_lease_ttl=60
-    acquire_retry_sleep= 30
+    keys = Keys.for_owner(args.owner)
+    lock_lease_ttl = 60
+    acquire_retry_sleep = 30
     lock = EtcdLock(keys.lock_key, args.owner)
     pending_queue = EtcdOperationQueue(keys.pending, lock)
     completed_queue = EtcdOperationQueue(keys.completed, lock)
     lease = EtcdLease()
-
 
     while True:
         if not pending_queue.peek():
@@ -1681,7 +1751,6 @@ def main():
             continue
 
         if not lock.is_held():
-
             if lease.id is None:
                 lease.grant(lock_lease_ttl)
 
@@ -1696,7 +1765,9 @@ def main():
         if moved:
             # dispatch hook
             print("dispatch hook")
-            dispatch_sub_cmd = f"JUJU_DISPATCH_PATH=hooks/rollingop_lock_granted {args.charm_dir}/dispatch"
+            dispatch_sub_cmd = (
+                f"JUJU_DISPATCH_PATH=hooks/rollingop_lock_granted {args.charm_dir}/dispatch"
+            )
             res = subprocess.run([args.run_cmd, "-u", args.unit_name, dispatch_sub_cmd])
             res.check_returncode()
         else:
@@ -1705,11 +1776,11 @@ def main():
 
         completed_queue.watch()
         operation = completed_queue.peek()
-        if operation.result == OperationResult.RETRY_HOLD.value: #and not operation.is_max_retry_reached():
+        if operation.result == OperationResult.RETRY_HOLD.value:
             completed_queue.move_head(keys.pending)
             continue
 
-        elif operation.result == OperationResult.RETRY_RELEASE.value: #and not operation.is_max_retry_reached():
+        elif operation.result == OperationResult.RETRY_RELEASE.value:
             completed_queue.move_head(keys.pending)
 
         else:

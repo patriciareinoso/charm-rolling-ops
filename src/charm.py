@@ -38,7 +38,10 @@ class CharmRollingOpsCharm(CharmBase):
         }
 
         self.restart_manager = RollingOpsManagerV2(
-            charm=self, peer_relation="restart", etcd_relation="etcd", callback_targets=callback_targets
+            charm=self,
+            peer_relation="restart",
+            etcd_relation="etcd",
+            callback_targets=callback_targets,
         )
 
         self.framework.observe(self.on.install, self._on_install)

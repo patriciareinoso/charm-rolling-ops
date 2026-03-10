@@ -10,8 +10,8 @@ python = "^3.10"
 ops = "^3.5.0"
 
 [tool.poetry.group.charm-libs.dependencies]
-cryptography = "*"  # tls_certificates lib v3
-jsonschema = "^4.24.0"  # tls_certificates lib v3
+tenacity = "~9.0.0"
+charmlibs-interfaces-tls-certificates = ">=1.0"
 
 [tool.poetry.group.format]
 optional = true
