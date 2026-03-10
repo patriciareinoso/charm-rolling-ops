@@ -185,25 +185,12 @@ LIBAPI = 1
 LIBPATCH = 0
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
-
-
-def _now_timestamp_str() -> str:
-    """UTC timestamp string with microseconds."""
-    return datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT)
+SECRET_FIELD = "rollingops-client-secret-id"
 
 
 def _now_timestamp() -> datetime:
     """UTC timestamp string with microseconds."""
     return datetime.now(timezone.utc)
-
-
-def _parse_timestamp(timestamp: str) -> Optional[datetime]:
-    """Parse timestamp string. Return 'now' on errors to avoid selecting invalid timestamps."""
-    try:
-        dt = datetime.strptime(timestamp, TIMESTAMP_FORMAT)
-        return dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
 
 
 def _args_to_json(data: dict[str, Any]) -> str:
@@ -213,6 +200,14 @@ def _args_to_json(data: dict[str, Any]) -> str:
 
 class LockNoRelationError(Exception):
     """Raised if we are trying to process a lock, but do not appear to have a relation yet."""
+
+
+class EtcdUnreachableError(Exception):
+    """Raised if etcd server is unreachable."""
+
+
+class EtcdNotConfiguredError(Exception):
+    """Raised if etcd client has not been configured yet (env file does not exist)."""
 
 
 @dataclass
@@ -359,72 +354,6 @@ class Operation:
         return hash((self.callback_id, _args_to_json(self.kwargs)))
 
 
-class OperationQueue:
-    """In-memory FIFO queue of Operations with encode/decode helpers for storing in a databag."""
-
-    def __init__(self, operations: Optional[list[Operation]] = None):
-        self.operations: list[Operation] = list(operations or [])
-
-    def __len__(self) -> int:
-        """Return the number of operations in the queue."""
-        return len(self.operations)
-
-    def is_empty(self) -> bool:
-        """Return True if there are no queued operations."""
-        return not self.operations
-
-    def peek(self) -> Optional[Operation]:
-        """Return the first operation in the queue if it exists."""
-        return self.operations[0] if self.operations else None
-
-    def _peek_last(self) -> Optional[Operation]:
-        """Return the last operation in the queue if it exists."""
-        return self.operations[-1] if self.operations else None
-
-    def dequeue(self) -> Optional[Operation]:
-        """Drop the first operation in the queue if it exists and return it."""
-        return self.operations.pop(0) if self.operations else None
-
-    def _enqueue(self, operation: Operation) -> bool:
-        """Append operation only if it is not equal to the last enqueued operation.
-
-        Returns True if added, False if it was already in the queue.
-        """
-        if last_operation := self._peek_last():
-            if last_operation == operation:
-                return False
-        self.operations.append(operation)
-        return True
-
-    def increase_attempt(self):
-        """Increment the attempt counter for the head operation and persist it."""
-        if self.is_empty():
-            return
-        self.operations[0].increase_attempt()
-
-    def enqueue_lock_request(
-        self, callback_id: str, kwargs: dict[str, Any], max_retry: int | None = None
-    ) -> bool:
-        """Enqueue a lock request."""
-        return self._enqueue(Operation.create(callback_id, kwargs, max_retry=max_retry))
-
-    def to_string(self) -> str:
-        """Encode entire queue to a single string."""
-        items = [op.to_string() for op in self.operations]
-        return json.dumps(items, separators=(",", ":"))
-
-    @classmethod
-    def from_string(cls, data: str) -> "OperationQueue":
-        """Decode queue from a single string."""
-        if not data:
-            return cls([])
-        items = json.loads(data)
-        if not isinstance(items, list):
-            raise ValueError("Queue string must decode to a JSON list")
-        operations = [Operation.from_string(s) for s in items]
-        return cls(operations)
-
-
 @dataclass(frozen=True)
 class Keys:
     """Collection of etcd key prefixes used for rolling operations.
@@ -463,226 +392,12 @@ class Keys:
         return cls(base=f"/rollingops/{owner}")
 
 
-class LockIntent(Enum):
-    """Unit-level lock intents stored in unit databags."""
-
-    REQUEST = "request"
-    RETRY_RELEASE = "retry-release"
-    RETRY_HOLD = "retry-hold"
-    IDLE = "idle"
-
-
 class OperationResult(Enum):
     """Callback return values."""
 
     RELEASE = "release"
     RETRY_RELEASE = "retry-release"
     RETRY_HOLD = "retry-hold"
-
-
-class Lock:
-    """State machine view over peer relation databags for a single unit.
-
-    This class is the only component that should directly read/write the peer relation
-    databags for lock state, queue state, and grant state.
-
-    Important:
-      - All relation databag values are strings.
-      - This class updates both unit databags and app databags, which triggers
-        relation-changed events.
-    """
-
-    def __init__(self, manager, unit=None):
-        self.relation = manager.model.relations[manager.relation_name][0]
-        if not self.relation:
-            # TODO: defer caller in this case (probably just fired too soon).
-            raise LockNoRelationError()
-
-        self.unit = unit or manager.model.unit
-        self.app = manager.model.app
-
-    @property
-    def _app_data(self):
-        return self.relation.data[self.app]
-
-    @property
-    def _unit_data(self):
-        return self.relation.data[self.unit]
-
-    @property
-    def _operations(self) -> OperationQueue:
-        return OperationQueue.from_string(self._unit_data.get("operations", ""))
-
-    def request(self, callback_id: str, kwargs: dict, max_retry: int | None = None):
-        """Enqueue an operation and mark this unit as requesting the lock.
-
-        Args:
-          callback_id: identifies which callback to execute.
-          kwargs: dict of callback kwargs.
-          max_retry: None -> unlimited retries, else explicit integer.
-        """
-        queue = self._operations
-        if queue.is_empty():
-            self._unit_data.update({"state": LockIntent.REQUEST.value})
-        if queue.enqueue_lock_request(callback_id, kwargs, max_retry):
-            logger.debug("Operation added to the queue.")
-        else:
-            logger.info("Operation %s not added to queue.")
-        self._unit_data.update({"operations": queue.to_string()})
-
-    def _set_retry(self, intent: LockIntent):
-        """Mark retry for the head operation.
-
-        If max_retry is reached, the head operation is dropped via complete().
-        """
-        self._increase_attempt()
-        if self._is_max_retry_reached():
-            logger.info("Operation max retry reached. Dropping")
-            self.complete()
-            return
-        self._unit_data.update({
-            "executed_at": _now_timestamp_str(),
-            "state": intent.value,
-        })
-
-    def retry_release(self):
-        """Mark retry for the head operation.
-
-        If max_retry is reached, the head operation is dropped via complete().
-        """
-        self._set_retry(LockIntent.RETRY_RELEASE)
-
-    def retry_hold(self):
-        """Mark retry for the head operation.
-
-        If max_retry is reached, the head operation is dropped via complete().
-        """
-        self._set_retry(LockIntent.RETRY_HOLD)
-
-    def complete(self):
-        """Mark the head operation as completed successfully, pop it from the queue.
-
-        Update unit state depending on whether more operations remain.
-        """
-        queue = self._operations
-        queue.dequeue()
-        next_state = LockIntent.REQUEST.value if queue.peek() else LockIntent.IDLE.value
-
-        self._unit_data.update({
-            "state": next_state,
-            "operations": queue.to_string(),
-            "executed_at": _now_timestamp_str(),
-        })
-
-    def release(self):
-        """Clear the application-level grant."""
-        self._app_data.update({"granted_unit": "", "granted_at": ""})
-
-    def grant(self) -> None:
-        """Grant a lock to a unit."""
-        self._app_data.update({
-            "granted_unit": str(self.unit.name),
-            "granted_at": _now_timestamp_str(),
-        })
-
-    def is_granted(self) -> bool:
-        """Return True if the unit holds the lock."""
-        granted_unit = self._app_data.get("granted_unit", "")
-        return granted_unit == str(self.unit.name)
-
-    def should_run(self) -> bool:
-        """Return True if the lock has been granted to the unit and it is time to execute callback."""
-        return self.is_granted() and not self._unit_executed_after_grant()
-
-    def should_release(self) -> bool:
-        """Return True if the unit finished executing the callback and should be released."""
-        return self.is_completed() or self._unit_executed_after_grant()
-
-    def is_waiting(self) -> bool:
-        """Return True if this unit is waiting for a lock to be granted."""
-        unit_intent = self._unit_data.get("state")
-        return unit_intent == LockIntent.REQUEST.value and not self.is_granted()
-
-    def is_completed(self) -> bool:
-        """Return True if this unit is completed callback but still has the grant (leader should clear)."""
-        unit_intent = self._unit_data.get("state")
-        return unit_intent == LockIntent.IDLE.value and self.is_granted()
-
-    def is_retry(self) -> bool:
-        """Return True if this unit requested retry but still has the grant (leader should clear)."""
-        unit_intent = self._unit_data.get("state")
-        return (
-            unit_intent == LockIntent.RETRY_RELEASE.value
-            or unit_intent == LockIntent.RETRY_HOLD.value
-        ) and self.is_granted()
-
-    def is_waiting_retry(self) -> bool:
-        """Return True if the unit requested retry and is waiting for lock to be granted."""
-        unit_intent = self._unit_data.get("state")
-        return unit_intent == LockIntent.RETRY_RELEASE.value and not self.is_granted()
-
-    def is_retry_hold(self) -> bool:
-        """Return True if the unit requested retry and is waiting for lock to be granted."""
-        unit_intent = self._unit_data.get("state")
-        return unit_intent == LockIntent.RETRY_HOLD.value and not self.is_granted()
-
-    def get_current_operation(self) -> Operation | None:
-        """Return the head operation for this unit, if any."""
-        return self._operations.peek()
-
-    def _is_max_retry_reached(self) -> bool:
-        """Return True if the head operation exceeded its max_retry (unless max_retry < 0)."""
-        operation = self.get_current_operation()
-        if not operation:
-            return True
-        return operation.is_max_retry_reached()
-
-    def _increase_attempt(self) -> None:
-        """Increment the attempt counter for the head operation and persist it."""
-        raw = self._unit_data.get("operations", "")
-        q = OperationQueue.from_string(raw)
-
-        q.increase_attempt()
-
-        self._unit_data.update({"operations": q.to_string()})
-
-    def get_last_completed(self) -> datetime | None:
-        """Get the time the unit requested a retry of the head operation."""
-        timestamp_str = self._unit_data.get("executed_at", "")
-        if timestamp_str:
-            return _parse_timestamp(timestamp_str)
-        return None
-
-    def get_requested_at(self) -> datetime | None:
-        """Get the time the head operation was requested at."""
-        operation = self.get_current_operation()
-        if not operation:
-            return None
-        return operation.requested_at
-
-    def _unit_executed_after_grant(self) -> bool:
-        granted_at = _parse_timestamp(self._app_data.get("granted_at", ""))
-        executed_at = _parse_timestamp(self._unit_data.get("executed_at", ""))
-
-        if granted_at is None or executed_at is None:
-            return False
-        return executed_at > granted_at
-
-
-class Locks:
-    """Iterator over Lock objects for each unit present on the peer relation."""
-
-    def __init__(self, manager):
-        relation = manager.model.relations[manager.relation_name][0]
-        units = list(relation.units)
-        units.append(manager.model.unit)
-        self._units = units
-        self._manager = manager
-
-    def __iter__(self):
-        """Yields a lock for each unit we can find on the relation."""
-        for unit in self._units:
-            yield Lock(self._manager, unit=unit)
 
 
 class RollingOpsLockGrantedEvent(EventBase):
@@ -704,17 +419,17 @@ class CertificatesManager:
         validity_days: Number of days the generated certificates remain valid.
     """
 
-    def __init__(self, base_dir: str = "/var/lib/rollingops/tls", validity_days: int = 365 * 10):
-        self.base = Path(base_dir)
-        self.base.mkdir(parents=True, exist_ok=True)
-        self.validity_days = validity_days
+    BASE_DIR = Path("/var/lib/rollingops/tls")
 
-        self.ca_key = self.base / "client-ca.key"
-        self.ca_certificate = self.base / "client-ca.pem"
-        self.client_key = self.base / "client.key"
-        self.client_certificate = self.base / "client.pem"
+    CA_KEY = BASE_DIR / "client-ca.key"
+    CA_CERT = BASE_DIR / "client-ca.pem"
+    CLIENT_KEY = BASE_DIR / "client.key"
+    CLIENT_CERT = BASE_DIR / "client.pem"
 
-    def exists(self) -> bool:
+    VALIDITY_DAYS = 365 * 10
+
+    @classmethod
+    def exists(cls) -> bool:
         """Check whether the required client certificates already exist.
 
         Returns:
@@ -722,13 +437,14 @@ class CertificatesManager:
             are present on disk, otherwise False.
         """
         return (
-            self.ca_key.exists()
-            and self.ca_certificate.exists()
-            and self.client_key.exists()
-            and self.client_certificate.exists()
+            cls.CA_KEY.exists()
+            and cls.CA_CERT.exists()
+            and cls.CLIENT_KEY.exists()
+            and cls.CLIENT_CERT.exists()
         )
 
-    def load_client_cert_and_key(self) -> tuple[str, str]:
+    @classmethod
+    def load_client_cert_and_key(cls) -> tuple[str, str]:
         """Load the client certificate and private key from disk.
 
         Returns:
@@ -736,9 +452,10 @@ class CertificatesManager:
             - The client certificate PEM string
             - The client private key PEM string
         """
-        return self.client_certificate.read_text(), self.client_key.read_text()
+        return cls.CLIENT_CERT.read_text(), cls.CLIENT_KEY.read_text()
 
-    def client_paths(self) -> tuple[Path, Path]:
+    @classmethod
+    def client_paths(cls) -> tuple[Path, Path]:
         """Return filesystem paths for the client certificate and key.
 
         Returns:
@@ -746,32 +463,32 @@ class CertificatesManager:
             - Path to the client certificate
             - Path to the client private key
         """
-        return self.client_certificate, self.client_key
+        return cls.CLIENT_CERT, cls.CLIENT_KEY
 
-    def persist_client_cert_and_key(self, cert_pem: str, key_pem: str) -> None:
+    @classmethod
+    def persist_client_cert_and_key(cls, cert_pem: str, key_pem: str) -> None:
         """Persist the provided client certificate and key to disk.
 
         Args:
             cert_pem: PEM-encoded client certificate.
             key_pem: PEM-encoded client private key.
         """
-        self.client_certificate.write_text(cert_pem)
-        self.client_key.write_text(key_pem)
+        cls.CLIENT_CERT.write_text(cert_pem)
+        cls.CLIENT_KEY.write_text(key_pem)
 
-        os.chmod(self.client_certificate, 0o644)
-        os.chmod(self.client_key, 0o600)
+        os.chmod(cls.CLIENT_CERT, 0o644)
+        os.chmod(cls.CLIENT_KEY, 0o600)
 
-    def has_client_cert_and_key(self, cert_pem: str, key_pem: str) -> bool:
+    @classmethod
+    def has_client_cert_and_key(cls, cert_pem: str, key_pem: str) -> bool:
         """Return whether the provided certificate material matches local files."""
-        if not self.client_certificate.exists() or not self.client_key.exists():
+        if not cls.CLIENT_CERT.exists() or not cls.CLIENT_KEY.exists():
             return False
 
-        return (
-            self.client_certificate.read_text() == cert_pem
-            and self.client_key.read_text() == key_pem
-        )
+        return cls.CLIENT_CERT.read_text() == cert_pem and cls.CLIENT_KEY.read_text() == key_pem
 
-    def generate(self, common_name: str) -> None:
+    @classmethod
+    def generate(cls, common_name: str) -> None:
         """Generate a client CA and client certificate if they do not exist.
 
         This method creates:
@@ -787,14 +504,14 @@ class CertificatesManager:
             common_name: Common Name (CN) used in the client certificate
                 subject. This value should not contain slashes.
         """
-        if self.exists():
+        if cls.exists():
             return
 
         ca_key = generate_private_key(key_size=4096)
         ca_crt = generate_ca(
             private_key=ca_key,
             common_name="rollingops-client-ca",
-            validity=timedelta(days=self.validity_days),
+            validity=timedelta(days=cls.VALIDITY_DAYS),
         )
 
         client_key = generate_private_key(key_size=4096)
@@ -809,19 +526,19 @@ class CertificatesManager:
             csr=csr,
             ca=ca_crt,
             ca_private_key=ca_key,
-            validity=timedelta(days=self.validity_days),
+            validity=timedelta(days=cls.VALIDITY_DAYS),
             is_ca=False,
         )
 
-        self.ca_key.write_text(ca_key.raw)
-        self.ca_certificate.write_text(ca_crt.raw)
-        self.client_key.write_text(client_key.raw)
-        self.client_certificate.write_text(client_crt.raw)
+        cls.CA_KEY.write_text(ca_key.raw)
+        cls.CA_CERT.write_text(ca_crt.raw)
+        cls.CLIENT_KEY.write_text(client_key.raw)
+        cls.CLIENT_CERT.write_text(client_crt.raw)
 
-        os.chmod(self.ca_key, 0o600)
-        os.chmod(self.client_key, 0o600)
-        os.chmod(self.ca_certificate, 0o644)
-        os.chmod(self.client_certificate, 0o644)
+        os.chmod(cls.CA_KEY, 0o600)
+        os.chmod(cls.CLIENT_KEY, 0o600)
+        os.chmod(cls.CA_CERT, 0o644)
+        os.chmod(cls.CLIENT_CERT, 0o644)
 
 
 class EtcdCtl:
@@ -884,7 +601,7 @@ class EtcdCtl:
             subprocess calls.
 
         Raises:
-            RuntimeError: If the environment file does not exist.
+            EtcdNotConfiguredError: If the environment file does not exist.
         """
         cls.ensure_initialized()
 
@@ -911,7 +628,7 @@ class EtcdCtl:
     def ensure_initialized(cls):
         """Checks whether the environment file for etcdctl is setup."""
         if not cls.ENV_FILE.exists():
-            raise RuntimeError(f"etcdctl env file does not exist: {cls.ENV_FILE}")
+            raise EtcdNotConfiguredError(f"etcdctl env file does not exist: {cls.ENV_FILE}")
 
     @classmethod
     def run(
@@ -1282,61 +999,40 @@ class EtcdOperationQueue:
         return True
 
 
-SECRET_FIELD = "rollingops-client-secret-id"
-
-
-class RollingOpsManagerV2(Object):  # handle case relation does not exist
+class RollingOpsManagerV2(Object):
     """Emitters and handlers for rolling ops."""
 
     def __init__(
         self,
         charm: CharmBase,
-        peer_relation: str,
-        etcd_relation: str,
+        peer_relation_name: str,
+        etcd_relation_name: str,
         callback_targets: dict[str, Any],
     ):
         """Register our custom events.
 
         params:
             charm: the charm we are attaching this to.
-            relation_name: the relation to integrate with etcd.
+            peer_relation_name: peer relation used for rolling ops.
+            etcd_relation_name: the relation to integrate with etcd.
             callback_targets: mapping from callback_id -> callable.
         """
         super().__init__(charm, "rolling-ops-manager")
         self._charm = charm
-        self.relation_name = peer_relation
-        self.etcd_relation_name = etcd_relation
+        self.peer_relation_name = peer_relation_name
+        self.etcd_relation_name = etcd_relation_name
         self.callback_targets = callback_targets
         self.charm_dir = charm.charm_dir
-        self.worker = RollingOpsAsyncWorker(charm, relation_name=peer_relation)
-
-        self.cert_manager = CertificatesManager(validity_days=365 * 10)  # 10 years
+        self.worker = RollingOpsAsyncWorker(charm, relation_name=peer_relation_name)
 
         cert = self._get_client_certificate_from_peer()
         mtls_cert = cert[0] if cert else None
 
         self.etcd = EtcdRequires(
             charm,
-            relation_name=etcd_relation,
+            relation_name=etcd_relation_name,
             prefix="/rollingops/",
             mtls_cert=mtls_cert,
-        )
-        charm.on.define_event("rollingop_lock_granted", RollingOpsLockGrantedEvent)
-
-        self.framework.observe(
-            charm.on[self.relation_name].relation_departed, self._on_relation_departed
-        )
-        self.framework.observe(charm.on.rollingop_lock_granted, self._on_rollingop_granted)
-        self.framework.observe(charm.on.update_status, self._on_rollingop_granted)
-        self.framework.observe(charm.on.install, self._on_install)
-        self.framework.observe(self.etcd.on.etcd_ready, self._on_etcd_ready)
-        self.framework.observe(charm.on.leader_elected, self._on_leader_elected)
-        self.framework.observe(
-            charm.on[self.relation_name].relation_changed, self._on_peer_relation_changed
-        )
-        self.framework.observe(
-            charm.on.secret_changed,
-            self._on_secret_changed,
         )
 
         owner = f"{self.model.name}-{self.model.unit.name}".replace("/", "-")
@@ -1346,9 +1042,31 @@ class RollingOpsManagerV2(Object):  # handle case relation does not exist
         self.pending_queue = EtcdOperationQueue(self.keys.pending, self.lock)
         self.inprogress_queue = EtcdOperationQueue(self.keys.inprogress, self.lock)
 
+        charm.on.define_event("rollingop_lock_granted", RollingOpsLockGrantedEvent)
+
+        self.framework.observe(
+            charm.on[self.peer_relation_name].relation_departed, self._on_relation_departed
+        )
+        self.framework.observe(
+            charm.on[self.etcd_relation_name].relation_departed, self._on_relation_departed
+        )
+        self.framework.observe(charm.on.rollingop_lock_granted, self._on_rollingop_granted)
+        self.framework.observe(charm.on.update_status, self._on_rollingop_granted)
+        self.framework.observe(charm.on.install, self._on_install)
+        self.framework.observe(self.etcd.on.etcd_ready, self._on_etcd_ready)
+        self.framework.observe(charm.on.leader_elected, self._on_leader_elected)
+        self.framework.observe(
+            charm.on[self.peer_relation_name].relation_changed, self._on_peer_relation_changed
+        )
+        self.framework.observe(charm.on.secret_changed, self._on_secret_changed)
+
     @property
-    def _relation(self) -> Relation | None:
-        return self.model.get_relation(self.relation_name)
+    def _peer_relation(self) -> Relation | None:
+        return self.model.get_relation(self.peer_relation_name)
+    
+    @property
+    def _etcd_relation(self) -> Relation | None:
+        return self.model.get_relation(self.etcd_relation_name)
 
     def _on_install(self, event) -> None:
         subprocess.run(["apt-get", "update"], check=True)
@@ -1363,7 +1081,7 @@ class RollingOpsManagerV2(Object):  # handle case relation does not exist
         It retrieves the endpoints and TLS configuration from the relation databags
         and generates an environment file used by etcdctl commands.
         """
-        relation = self.model.get_relation(self.etcd_relation_name)
+        relation = self._etcd_relation
         if not relation:
             return
 
@@ -1379,7 +1097,7 @@ class RollingOpsManagerV2(Object):  # handle case relation does not exist
             logger.warning("No etcd endpoints yet")
             return
 
-        client_cert_path, client_key_path = self.cert_manager.client_paths()
+        client_cert_path, client_key_path = CertificatesManager.client_paths()
 
         EtcdCtl.write_env_file(
             endpoints=endpoints,
@@ -1408,7 +1126,7 @@ class RollingOpsManagerV2(Object):  # handle case relation does not exist
         Only the leader generates the certificate and writes it to the peer
         relation application databag.
         """
-        relation = self._relation
+        relation = self._peer_relation
         if relation is None or not self.model.unit.is_leader():
             return
 
@@ -1419,8 +1137,8 @@ class RollingOpsManagerV2(Object):  # handle case relation does not exist
             return
 
         common_name = f"rollingops-{self.model.name}-{self.model.app.name}"
-        self.cert_manager.generate(common_name)
-        cert_pem, key_pem = self.cert_manager.load_client_cert_and_key()
+        CertificatesManager.generate(common_name)
+        cert_pem, key_pem = CertificatesManager.load_client_cert_and_key()
 
         secret = self.model.app.add_secret(
             {"cert": cert_pem, "key": key_pem},
@@ -1433,7 +1151,7 @@ class RollingOpsManagerV2(Object):  # handle case relation does not exist
         Returns:
             A tuple of (certificate_pem, key_pem), or None if not yet available.
         """
-        relation = self._relation
+        relation = self._peer_relation
         if relation is None:
             return None
 
@@ -1459,37 +1177,31 @@ class RollingOpsManagerV2(Object):  # handle case relation does not exist
             return False
 
         cert_pem, key_pem = shared
-        if self.cert_manager.has_client_cert_and_key(cert_pem, key_pem):
+        if CertificatesManager.has_client_cert_and_key(cert_pem, key_pem):
             return True
 
-        self.cert_manager.persist_client_cert_and_key(cert_pem, key_pem)
+        CertificatesManager.persist_client_cert_and_key(cert_pem, key_pem)
         return True
 
     def _on_rollingop_granted(self, event: RollingOpsLockGrantedEvent) -> None:
-        if not self._relation:
-            return
-        etcd_relation = self.model.get_relation(self.etcd_relation_name)
-        if not etcd_relation:
+        if not self._peer_relation or not self._etcd_relation:
             return
         try:
             EtcdCtl.ensure_initialized()
-        except RuntimeError:
+        except EtcdNotConfiguredError:
             return
         logger.info("Received a rolling-op lock granted event.")
         self._on_run_with_lock()
 
-    def _on_relation_departed(self, event: RelationDepartedEvent) -> None:  # check
+    def _on_relation_departed(self, event: RelationDepartedEvent) -> None:
         """Leader cleanup: if a departing unit was granted, clear the grant.
 
         This prevents deadlocks when the granted unit leaves the relation.
         """
-        if not self.model.unit.is_leader():
-            return
-        if unit := event.departing_unit:
-            lock = Lock(self, unit)
-            if lock.is_granted():
-                lock.release()
-                self._process_locks()
+        unit = event.departing_unit
+        if unit == self.model.unit:
+            self.worker.stop()
+            self.lock.release()
 
     def request_async_lock(
         self,
@@ -1518,7 +1230,8 @@ class RollingOpsManagerV2(Object):  # handle case relation does not exist
 
         Raises:
             ValueError: If the callback_id is not registered or invalid parameters
-            LockNoRelationError: if the etcd relation does not exist or etcdctl is not configured
+            LockNoRelationError: if the etcd relation does not exist
+            EtcdNotConfiguredError: if etcd client has not been configured yet
         """
         if callback_id not in self.callback_targets:
             raise ValueError(f"Unknown callback_id: {callback_id}")
@@ -1526,10 +1239,8 @@ class RollingOpsManagerV2(Object):  # handle case relation does not exist
         etcd_relation = self.model.get_relation(self.etcd_relation_name)
         if not etcd_relation:
             raise LockNoRelationError
-        try:
-            EtcdCtl.ensure_initialized()
-        except RuntimeError:
-            raise LockNoRelationError
+
+        EtcdCtl.ensure_initialized()
 
         operation = Operation.create(callback_id, kwargs, max_retry)
         res = self.pending_queue.enqueue(operation)

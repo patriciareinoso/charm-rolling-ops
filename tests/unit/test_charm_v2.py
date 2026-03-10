@@ -33,19 +33,32 @@ def test_leader_elected_creates_shared_secret_and_stores_id():
         leader=True,
         relations={peer_relation},
     )
-    with patch("charms.rolling_ops.v2.rollingops.CertificatesManager") as mock_cert_manager:
-        cm = mock_cert_manager.return_value
-        cm.exists.return_value = False
-        cm.load_client_cert_and_key.return_value = ("CERT_PEM", "KEY_PEM")
-        cm.client_paths.return_value = (Path("/tmp/client.pem"), Path("/tmp/client.key"))
-        cm.generate.return_value = None
-        with patch("charms.rolling_ops.v2.rollingops.EtcdCtl"):
-            state_out = ctx.run(ctx.on.leader_elected(), state_in)
+
+    with (
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.exists",
+            return_value=False,
+        ),
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.generate",
+            return_value=None,
+        ) as mock_generate,
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.load_client_cert_and_key",
+            return_value=("CERT_PEM", "KEY_PEM"),
+        ),
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.client_paths",
+            return_value=(Path("/tmp/client.pem"), Path("/tmp/client.key")),
+        ),
+        patch("charms.rolling_ops.v2.rollingops.EtcdCtl"),
+    ):
+        state_out = ctx.run(ctx.on.leader_elected(), state_in)
 
         peer_out = next(r for r in state_out.relations if r.endpoint == "restart")
         assert SECRET_FIELD in peer_out.local_app_data
         assert peer_out.local_app_data[SECRET_FIELD].startswith("secret:")
-        cm.generate.assert_called_once()
+        mock_generate.assert_called_once()
 
 
 def test_leader_elected_does_not_regenerate_when_secret_already_exists():
@@ -64,18 +77,30 @@ def test_leader_elected_does_not_regenerate_when_secret_already_exists():
 
     state_in = State(leader=True, relations={peer_relation}, secrets=[secret])
 
-    with patch("charms.rolling_ops.v2.rollingops.CertificatesManager") as mock_cert_manager:
-        cm = mock_cert_manager.return_value
-        cm.exists.return_value = False
-        cm.load_client_cert_and_key.return_value = ("CERT_PEM", "KEY_PEM")
-        cm.client_paths.return_value = (Path("/tmp/client.pem"), Path("/tmp/client.key"))
-        cm.generate.return_value = None
-        with patch("charms.rolling_ops.v2.rollingops.EtcdCtl"):
-            state_out = ctx.run(ctx.on.leader_elected(), state_in)
+    with (
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.exists",
+            return_value=False,
+        ),
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.generate",
+            return_value=None,
+        ) as mock_generate,
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.load_client_cert_and_key",
+            return_value=("CERT_PEM", "KEY_PEM"),
+        ),
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.client_paths",
+            return_value=(Path("/tmp/client.pem"), Path("/tmp/client.key")),
+        ),
+        patch("charms.rolling_ops.v2.rollingops.EtcdCtl"),
+    ):
+        state_out = ctx.run(ctx.on.leader_elected(), state_in)
 
         peer_out = next(r for r in state_out.relations if r.endpoint == "restart")
         assert peer_out.local_app_data[SECRET_FIELD] == "secret:existing"
-        cm.generate.assert_not_called()
+        mock_generate.assert_not_called()
 
 
 def test_non_leader_does_not_create_shared_secret():
@@ -87,18 +112,30 @@ def test_non_leader_does_not_create_shared_secret():
         relations=[peer_relation],
     )
 
-    with patch("charms.rolling_ops.v2.rollingops.CertificatesManager") as mock_cert_manager:
-        cm = mock_cert_manager.return_value
-        cm.exists.return_value = False
-        cm.load_client_cert_and_key.return_value = ("CERT_PEM", "KEY_PEM")
-        cm.client_paths.return_value = (Path("/tmp/client.pem"), Path("/tmp/client.key"))
-        cm.generate.return_value = None
-        with patch("charms.rolling_ops.v2.rollingops.EtcdCtl"):
-            state_out = ctx.run(ctx.on.relation_changed(peer_relation, remote_unit=1), state_in)
+    with (
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.exists",
+            return_value=False,
+        ),
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.generate",
+            return_value=None,
+        ) as mock_generate,
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.load_client_cert_and_key",
+            return_value=("CERT_PEM", "KEY_PEM"),
+        ),
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.client_paths",
+            return_value=(Path("/tmp/client.pem"), Path("/tmp/client.key")),
+        ),
+        patch("charms.rolling_ops.v2.rollingops.EtcdCtl"),
+    ):
+        state_out = ctx.run(ctx.on.relation_changed(peer_relation, remote_unit=1), state_in)
 
-            peer_out = next(r for r in state_out.relations if r.endpoint == "restart")
-            assert SECRET_FIELD not in peer_out.local_app_data
-            cm.generate.assert_not_called()
+        peer_out = next(r for r in state_out.relations if r.endpoint == "restart")
+        assert SECRET_FIELD not in peer_out.local_app_data
+        mock_generate.assert_not_called()
 
 
 def test_relation_changed_syncs_local_certificate_from_secret():
@@ -117,13 +154,33 @@ def test_relation_changed_syncs_local_certificate_from_secret():
         relations=[peer_relation],
         secrets=[secret],
     )
-    with patch("charms.rolling_ops.v2.rollingops.CertificatesManager") as mock_cert_manager:
-        cm = mock_cert_manager.return_value
-        cm.exists.return_value = False
-        cm.load_client_cert_and_key.return_value = ("CERT_PEM", "KEY_PEM")
-        cm.has_client_cert_and_key.return_value = False
-        cm.client_paths.return_value = (Path("/tmp/client.pem"), Path("/tmp/client.key"))
-        cm.generate.return_value = None
-        with patch("charms.rolling_ops.v2.rollingops.EtcdCtl"):
-            ctx.run(ctx.on.relation_changed(peer_relation, remote_unit=1), state_in)
-            cm.persist_client_cert_and_key.assert_called_once_with("CERT_PEM", "KEY_PEM")
+
+    with (
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.exists",
+            return_value=False,
+        ),
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.generate",
+            return_value=None,
+        ),
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.load_client_cert_and_key",
+            return_value=("CERT_PEM", "KEY_PEM"),
+        ),
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.has_client_cert_and_key",
+            return_value=False,
+        ),
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.client_paths",
+            return_value=(Path("/tmp/client.pem"), Path("/tmp/client.key")),
+        ),
+        patch(
+            "charms.rolling_ops.v2.rollingops.CertificatesManager.persist_client_cert_and_key",
+            return_value=(Path("/tmp/client.pem"), Path("/tmp/client.key")),
+        ) as mock_persit,
+        patch("charms.rolling_ops.v2.rollingops.EtcdCtl"),
+    ):
+        ctx.run(ctx.on.relation_changed(peer_relation, remote_unit=1), state_in)
+        mock_persit.assert_called_once_with("CERT_PEM", "KEY_PEM")
