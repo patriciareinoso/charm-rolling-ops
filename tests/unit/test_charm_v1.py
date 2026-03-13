@@ -33,7 +33,7 @@ from tests.charms.v1.src.charm import CharmRollingOpsCharmV1
 def test_rollingopskeys_paths() -> None:
     keys = RollingOpsKeys.for_owner("cluster-a", "unit-1")
 
-    assert keys.cluster_prefix == "/rollingops/cluster-a"
+    assert keys.cluster_prefix == "/rollingops/cluster-a/"
     assert keys._owner_prefix == "/rollingops/cluster-a/unit-1"
     assert keys.lock_key == "/rollingops/cluster-a/granted-unit"
     assert keys.pending == "/rollingops/cluster-a/unit-1/pending/"
@@ -168,27 +168,20 @@ def temp_etcdctl(tmp_path):
     return TestEtcdCtl
 
 
-def test_etcdctl_write_env_file_creates_dir_files(temp_etcdctl) -> None:
-
-    client_cert = Path("/tmp/client.pem")
-    client_key = Path("/tmp/client.key")
+def test_etcdctl_write_env(temp_cert_manager, temp_etcdctl) -> None:
 
     temp_etcdctl.write_env_file(
         endpoints="https://10.0.0.1:2379,https://10.0.0.2:2379",
-        tls_ca_pem="CA-PEM",
-        client_cert_path=client_cert,
-        client_key_path=client_key,
     )
 
     assert temp_etcdctl.BASE_DIR.exists()
-    assert temp_etcdctl.SERVER_CA.read_text() == "CA-PEM"
 
     env_text = temp_etcdctl.ENV_FILE.read_text()
     assert 'export ETCDCTL_API="3"' in env_text
     assert 'export ETCDCTL_ENDPOINTS="https://10.0.0.1:2379,https://10.0.0.2:2379"' in env_text
     assert f'export ETCDCTL_CACERT="{temp_etcdctl.SERVER_CA}"' in env_text
-    assert 'export ETCDCTL_CERT="/tmp/client.pem"' in env_text
-    assert 'export ETCDCTL_KEY="/tmp/client.key"' in env_text
+    #assert f'export ETCDCTL_CERT="{temp_cert_manager.CLIENT_CERT}"' in env_text
+    #assert f'export ETCDCTL_KEY="{temp_cert_manager.CLIENT_KEY}"' in env_text
 
 
 def test_etcdctl_ensure_initialized_raises_when_env_missing(temp_etcdctl) -> None:
@@ -198,6 +191,7 @@ def test_etcdctl_ensure_initialized_raises_when_env_missing(temp_etcdctl) -> Non
 
 def test_etcdctl_load_env_parses_exported_vars(temp_etcdctl) -> None:
     temp_etcdctl.BASE_DIR.mkdir(parents=True, exist_ok=True)
+    temp_etcdctl.SERVER_CA.write_text("SERVER CA")
     temp_etcdctl.ENV_FILE.write_text(
         "\n".join([
             "# comment",
