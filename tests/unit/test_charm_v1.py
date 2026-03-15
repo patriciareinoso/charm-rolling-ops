@@ -65,33 +65,23 @@ def temp_cert_manager(tmp_path):
 
 
 def test_certificates_manager_exists_returns_false_when_no_files(temp_cert_manager) -> None:
-    assert temp_cert_manager.exists() is False
+    assert temp_cert_manager._exists() is False
 
+def test_certificates_manager_exists_returns_false_when_cert_does_not_exist(temp_cert_manager) -> None:
+    temp_cert_manager.CLIENT_KEY.write_text("client-key")
+
+    assert temp_cert_manager._exists() is False
+
+def test_certificates_manager_exists_returns_false_when_key_does_not_exist(temp_cert_manager) -> None:
+    temp_cert_manager.CLIENT_CERT.write_text("client-cert")
+
+    assert temp_cert_manager._exists() is False
 
 def test_certificates_manager_exists_returns_true_when_all_files_exist(temp_cert_manager) -> None:
-    temp_cert_manager.CA_KEY.write_text("ca-key")
-    temp_cert_manager.CA_CERT.write_text("ca-cert")
     temp_cert_manager.CLIENT_KEY.write_text("client-key")
     temp_cert_manager.CLIENT_CERT.write_text("client-cert")
 
-    assert temp_cert_manager.exists() is True
-
-
-def test_certificates_manager_load_cert_and_key(temp_cert_manager) -> None:
-    temp_cert_manager.CLIENT_CERT.write_text("client-cert-pem")
-    temp_cert_manager.CLIENT_KEY.write_text("client-key-pem")
-
-    cert_pem, key_pem = temp_cert_manager.load_client_cert_and_key()
-
-    assert cert_pem == "client-cert-pem"
-    assert key_pem == "client-key-pem"
-
-
-def test_certificates_manager_client_paths(temp_cert_manager) -> None:
-    cert_path, key_path = temp_cert_manager.client_paths()
-
-    assert cert_path == temp_cert_manager.CLIENT_CERT
-    assert key_path == temp_cert_manager.CLIENT_KEY
+    assert temp_cert_manager._exists() is True
 
 
 def test_certificates_manager_persist_client_cert_and_key_writes_files(
@@ -150,7 +140,7 @@ def test_certificates_manager_generate_creates_all_files(
 ) -> None:
 
     temp_cert_manager.generate(common_name="unit-1")
-    assert temp_cert_manager.exists() is True
+    assert temp_cert_manager._exists() is True
 
     assert temp_cert_manager.CA_KEY.read_text().startswith("-----BEGIN RSA PRIVATE KEY-----")
     assert temp_cert_manager.CA_CERT.read_text().startswith("-----BEGIN CERTIFICATE-----")
@@ -168,10 +158,12 @@ def temp_etcdctl(tmp_path):
     return TestEtcdCtl
 
 
-def test_etcdctl_write_env(temp_cert_manager, temp_etcdctl) -> None:
+def test_etcdctl_write_env(temp_etcdctl) -> None:
 
     temp_etcdctl.write_env_file(
         endpoints="https://10.0.0.1:2379,https://10.0.0.2:2379",
+        client_cert_path="PATH1",
+        client_key_path="PATH2",
     )
 
     assert temp_etcdctl.BASE_DIR.exists()
@@ -180,8 +172,8 @@ def test_etcdctl_write_env(temp_cert_manager, temp_etcdctl) -> None:
     assert 'export ETCDCTL_API="3"' in env_text
     assert 'export ETCDCTL_ENDPOINTS="https://10.0.0.1:2379,https://10.0.0.2:2379"' in env_text
     assert f'export ETCDCTL_CACERT="{temp_etcdctl.SERVER_CA}"' in env_text
-    #assert f'export ETCDCTL_CERT="{temp_cert_manager.CLIENT_CERT}"' in env_text
-    #assert f'export ETCDCTL_KEY="{temp_cert_manager.CLIENT_KEY}"' in env_text
+    assert 'export ETCDCTL_CERT="PATH1"' in env_text
+    assert 'export ETCDCTL_KEY="PATH2"' in env_text
 
 
 def test_etcdctl_ensure_initialized_raises_when_env_missing(temp_etcdctl) -> None:
@@ -219,21 +211,13 @@ def test_etcdctl_load_env_parses_exported_vars(temp_etcdctl) -> None:
 def certificates_manager_patches():
     with (
         patch(
-            "charms.rolling_ops.v1.rollingops.CertificatesManager.exists",
+            "charms.rolling_ops.v1.rollingops.CertificatesManager._exists",
             return_value=False,
         ),
         patch(
             "charms.rolling_ops.v1.rollingops.CertificatesManager.generate",
-            return_value=None,
+            return_value=("CERT_PEM", "KEY_PEM")
         ) as mock_generate,
-        patch(
-            "charms.rolling_ops.v1.rollingops.CertificatesManager.load_client_cert_and_key",
-            return_value=("CERT_PEM", "KEY_PEM"),
-        ),
-        patch(
-            "charms.rolling_ops.v1.rollingops.CertificatesManager.client_paths",
-            return_value=(Path("/tmp/client.pem"), Path("/tmp/client.key")),
-        ),
         patch(
             "charms.rolling_ops.v1.rollingops.CertificatesManager.persist_client_cert_and_key",
             return_value=(Path("/tmp/client.pem"), Path("/tmp/client.key")),

@@ -35,14 +35,11 @@ from charmlibs.interfaces.tls_certificates import (
     PrivateKey,
 )
 from charms.data_platform_libs.v1.data_interfaces import (
-    DataContractV1,
     RequirerCommonModel,
-    RequirerDataContractV1,
     ResourceCreatedEvent,
     ResourceEndpointsChangedEvent,
     ResourceProviderModel,
     ResourceRequirerEventHandler,
-    build_model,
 )
 from ops import Relation
 from ops.charm import (
@@ -166,33 +163,16 @@ class CertificatesManager:
     VALIDITY_DAYS = 365 * 20
 
     @classmethod
-    def exists(cls) -> bool:
+    def _exists(cls) -> bool:
         """Check whether the required client certificates already exist.
 
         Returns:
-            True if the client certificate and key and the CA certificate
-            are present on disk, otherwise False.
+            True if the client certificate and key are present on disk, otherwise False.
         """
-        return (
-            cls.CA_KEY.exists()
-            and cls.CA_CERT.exists()
-            and cls.CLIENT_KEY.exists()
-            and cls.CLIENT_CERT.exists()
-        )
+        return cls.CLIENT_KEY.exists() and cls.CLIENT_CERT.exists()
 
     @classmethod
-    def load_client_cert_and_key(cls) -> tuple[str, str]:
-        """Load the client certificate and private key from disk.
-
-        Returns:
-            A tuple containing:
-            - The client certificate PEM string
-            - The client private key PEM string
-        """
-        return cls.CLIENT_CERT.read_text(), cls.CLIENT_KEY.read_text()
-
-    @classmethod
-    def client_paths(cls) -> tuple[Path, Path]:
+    def client_paths(cls) -> bool:
         """Return filesystem paths for the client certificate and key.
 
         Returns:
@@ -201,6 +181,7 @@ class CertificatesManager:
             - Path to the client private key
         """
         return cls.CLIENT_CERT, cls.CLIENT_KEY
+
 
     @classmethod
     def persist_client_cert_and_key(cls, cert_pem: str, key_pem: str) -> None:
@@ -226,7 +207,7 @@ class CertificatesManager:
         return cls.CLIENT_CERT.read_text() == cert_pem and cls.CLIENT_KEY.read_text() == key_pem
 
     @classmethod
-    def generate(cls, common_name: str) -> None:
+    def generate(cls, common_name: str) -> tuple[str, str]:
         """Generate a client CA and client certificate if they do not exist.
 
         This method creates:
@@ -241,9 +222,14 @@ class CertificatesManager:
         Args:
             common_name: Common Name (CN) used in the client certificate
                 subject. This value should not contain slashes.
+
+        Returns:
+            A tuple containing:
+            - The client certificate PEM string
+            - The client private key PEM string
         """
-        if cls.exists():
-            return
+        if cls._exists():
+            return cls.CLIENT_CERT.read_text(), cls.CLIENT_KEY.read_text()
 
         cls.BASE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -285,6 +271,8 @@ class CertificatesManager:
         os.chmod(cls.CA_CERT, 0o644)
         os.chmod(cls.CLIENT_CERT, 0o644)
 
+        return client_crt.raw, client_key.raw
+
 
 class EtcdCtl:
     """Class for interacting with etcd through the etcdctl CLI.
@@ -300,7 +288,7 @@ class EtcdCtl:
     ENV_FILE = BASE_DIR / "etcdctl.env"
 
     @classmethod
-    def write_server_ca(cls, tls_ca_pem: str) -> None:
+    def write_trusted_server_ca(cls, tls_ca_pem: str) -> None:
         """Persist the etcd server CA certificate to disk.
 
         Args:
@@ -319,6 +307,8 @@ class EtcdCtl:
     def write_env_file(
         cls,
         endpoints: str,
+        client_cert_path: Path,
+        client_key_path: Path,
     ) -> None:
         """Create or update the etcdctl environment configuration file.
 
@@ -327,6 +317,8 @@ class EtcdCtl:
 
         Args:
             endpoints: Comma-separated list of etcd endpoints.
+            client_cert_path:
+            client_key_path:
         """
         cls.BASE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -334,8 +326,8 @@ class EtcdCtl:
             'export ETCDCTL_API="3"',
             f'export ETCDCTL_ENDPOINTS="{endpoints}"',
             f'export ETCDCTL_CACERT="{cls.SERVER_CA}"',
-            f'export ETCDCTL_CERT="{CertificatesManager.CLIENT_CERT}"',
-            f'export ETCDCTL_KEY="{CertificatesManager.CLIENT_KEY}"',
+            f'export ETCDCTL_CERT="{client_cert_path}"',
+            f'export ETCDCTL_KEY="{client_key_path}"',
             "",
         ]
 
@@ -489,6 +481,179 @@ class EtcdCtl:
         logger.debug("etcd txn result: %s", res.stdout)
         return "SUCCESS" in res.stdout
 
+class SharedClientCertificateManager(Object):
+    """Manage the shared rollingops client certificate via peer relation secret."""
+
+    def __init__(self, charm, peer_relation_name: str) -> None:
+        super().__init__(charm, "shared-client-certificate")
+        self.charm = charm
+        self.peer_relation_name = peer_relation_name
+
+        self.framework.observe(charm.on.leader_elected, self._on_leader_elected)
+        self.framework.observe(
+            charm.on[peer_relation_name].relation_changed,
+            self._on_peer_relation_changed,
+        )
+        self.framework.observe(charm.on.secret_changed, self._on_secret_changed)
+
+    @property
+    def _peer_relation(self) -> Relation | None:
+        return self.model.get_relation(self.peer_relation_name)
+
+    def _on_leader_elected(self, event) -> None:
+        self.create_and_share_certificate()
+
+    def _on_secret_changed(self, event):
+        # if event.secret.label == "rollingops-client-cert":
+        #    self._sync_client_certificate()
+        self.sync_to_local_files()
+
+    def _on_peer_relation_changed(self, event) -> None:
+        """React to peer relation changes.
+
+        The leader ensures the shared certificate exists.
+        All units try to persist the shared certificate locally if available.
+        """
+        self.create_and_share_certificate()
+        self.sync_to_local_files()
+
+    def create_and_share_certificate(self) -> None:
+        """Ensure the application client certificate exists.
+
+        Only the leader generates the certificate and writes it to the peer
+        relation application databag.
+        """
+        relation = self._peer_relation
+        if relation is None or not self.model.unit.is_leader():
+            return
+
+        app_data = relation.data[self.model.app]
+        secret_id = app_data.get(SECRET_FIELD)
+        if secret_id:
+            return
+
+        common_name = f"rollingops-{self.model.uuid}-{self.model.app.name}"
+        cert_pem, key_pem = CertificatesManager.generate(common_name)
+
+        secret = self.model.app.add_secret({"cert": cert_pem, "key": key_pem})
+        app_data[SECRET_FIELD] = secret.id
+
+    def get_shared_certificate(self) -> tuple[str, str] | None:
+        """Return the client certificate and key from peer app data.
+
+        Returns:
+            A tuple of (certificate_pem, key_pem), or None if not yet available.
+        """
+        relation = self._peer_relation
+        if relation is None:
+            return None
+
+        secret_id = relation.data[self.model.app].get(SECRET_FIELD)
+        if not secret_id:
+            return None
+
+        secret = self.model.get_secret(id=secret_id)
+        content = secret.get_content(refresh=True)
+        return content["cert"], content["key"]
+
+    def sync_to_local_files(self) -> None:
+        """Persist shared certificate locally if available."""
+        shared = self.get_shared_certificate()
+        if shared is None:
+            logger.debug("Shared rollingops client certificate is not available yet")
+            return False
+
+        cert_pem, key_pem = shared
+        if CertificatesManager.has_client_cert_and_key(cert_pem, key_pem):
+            return
+
+        CertificatesManager.persist_client_cert_and_key(cert_pem, key_pem)
+
+
+    def get_local_request_cert(self) -> str:
+        """Return the cert to place in relation requests."""
+        shared = self.get_shared_certificate()
+        return "" if shared is None else shared[0]
+
+class EtcdRequiresV1(Object):
+    """EtcdRequires implementation for data interfaces version 1."""
+
+    def __init__(
+        self,
+        charm,
+        relation_name: str,
+        cluster_id: str,
+        shared_certificates: SharedClientCertificateManager,
+    ) -> None:
+        super().__init__(charm, "requirer-etcd")
+        self.charm = charm
+        self.cluster_id = cluster_id
+        self.shared_certificates = shared_certificates
+
+        self.etcd_interface = ResourceRequirerEventHandler(
+            self.charm,
+            relation_name=relation_name,
+            requests=self.client_requests(),
+            response_model=ResourceProviderModel,
+        )
+
+        self.framework.observe(
+            self.etcd_interface.on.endpoints_changed, self._on_endpoints_changed
+        )
+        self.framework.observe(self.etcd_interface.on.resource_created, self._on_resource_created)
+
+    @property
+    def etcd_relation(self) -> Relation | None:
+        """Return the etcd relation if present."""
+        relations = self.etcd_interface.relations
+        return relations[0] if relations else None
+
+    def _on_endpoints_changed(
+        self, event: ResourceEndpointsChangedEvent[ResourceProviderModel]
+    ) -> None:
+        """Handle etcd client relation data changed event."""
+        response = event.response
+        logger.info("etcd endpoints changed: %s", response.endpoints)
+
+        if not response.endpoints:
+            logger.error("No etcd endpoints available")
+            return
+
+        self.shared_certificates.sync_to_local_files()
+        cert_path, key_path = CertificatesManager.client_paths()
+        EtcdCtl.write_env_file(
+            endpoints=response.endpoints,
+            client_cert_path=cert_path,
+            client_key_path=key_path,
+        )
+
+    def _on_resource_created(self, event: ResourceCreatedEvent[ResourceProviderModel]) -> None:
+        """Handle resource created event."""
+        response = event.response
+
+        if not response.tls_ca:
+            logger.error("No etcd server CA chain available")
+            return
+
+        EtcdCtl.write_trusted_server_ca(tls_ca_pem=response.tls_ca)
+
+        if response.endpoints:
+            cert_path, key_path = CertificatesManager.client_paths()
+            EtcdCtl.write_env_file(endpoints=response.endpoints,client_cert_path=cert_path,client_key_path=key_path)
+        else:
+            logger.error("No etcd endpoints available")
+
+        self.shared_certificates.sync_to_local_files()
+
+    def client_requests(self) -> list[RequirerCommonModel]:
+        """Return the client requests for the etcd requirer interface."""
+        return [
+            RequirerCommonModel(
+                resource=self.cluster_id,
+                mtls_cert=self.shared_certificates.get_local_request_cert(),
+            )
+        ]
+
 
 class RollingOpsLockGrantedEvent(EventBase):
     """Custom event emitted when the background worker grants the lock."""
@@ -520,17 +685,23 @@ class EtcdRollingOpsManager(Object):
         self.etcd_relation_name = etcd_relation_name
         self.callback_targets = callback_targets
         self.charm_dir = charm.charm_dir
+
         owner = f"{self.model.uuid}-{self.model.unit.name}".replace("/", "-")
         self.worker = EtcdRollingOpsAsyncWorker(
             charm, peer_relation_name=peer_relation_name, owner=owner
         )
-
         self.keys = RollingOpsKeys.for_owner(cluster_id, owner)
+
+        self.shared_certificates = SharedClientCertificateManager(
+            charm,
+            peer_relation_name=peer_relation_name,
+        )
 
         self.etcd = EtcdRequiresV1(
             charm,
             relation_name=etcd_relation_name,
-            cluster_id = self.keys.cluster_prefix,
+            cluster_id=self.keys.cluster_prefix,
+            shared_certificates=self.shared_certificates,
         )
 
         charm.on.define_event("rollingops_lock_granted", RollingOpsLockGrantedEvent)
@@ -542,13 +713,8 @@ class EtcdRollingOpsManager(Object):
             charm.on[self.etcd_relation_name].relation_departed, self._on_relation_departed
         )
         self.framework.observe(charm.on.rollingops_lock_granted, self._on_rollingop_granted)
-        self.framework.observe(charm.on.update_status, self._on_rollingop_granted)
         self.framework.observe(charm.on.install, self._on_install)
-        self.framework.observe(charm.on.leader_elected, self._on_leader_elected)
-        self.framework.observe(
-            charm.on[self.peer_relation_name].relation_changed, self._on_peer_relation_changed
-        )
-        self.framework.observe(charm.on.secret_changed, self._on_secret_changed)
+
 
     @property
     def _peer_relation(self) -> Relation | None:
@@ -562,85 +728,6 @@ class EtcdRollingOpsManager(Object):
         subprocess.run(["apt-get", "update"], check=True)
         subprocess.run(["apt-get", "install", "-y", "etcd-client"], check=True)
 
-    def _on_leader_elected(self, event) -> None:
-        self._create_and_share_certificate()
-
-    def _on_secret_changed(self, event):
-        # if event.secret.label == "rollingops-client-cert":
-        #    self._sync_client_certificate()
-        self._sync_client_certificate()
-
-    def _on_peer_relation_changed(self, event) -> None:
-        """React to peer relation changes.
-
-        The leader ensures the shared certificate exists.
-        All units try to persist the shared certificate locally if available.
-        """
-        self._create_and_share_certificate()
-        self._sync_client_certificate()
-
-    def _create_and_share_certificate(self) -> None:
-        """Ensure the application client certificate exists.
-
-        Only the leader generates the certificate and writes it to the peer
-        relation application databag.
-        """
-        relation = self._peer_relation
-
-        if relation is None or not self.model.unit.is_leader():
-            return
-
-        app_data = relation.data[self.model.app]
-        secret_id = app_data.get(SECRET_FIELD)
-        if secret_id:
-            return
-
-        common_name = f"rollingops-{self.model.uuid}-{self.model.app.name}"
-        CertificatesManager.generate(common_name)
-        cert_pem, key_pem = CertificatesManager.load_client_cert_and_key()
-
-        secret = self.model.app.add_secret(
-            {"cert": cert_pem, "key": key_pem},
-        )
-        app_data[SECRET_FIELD] = secret.id
-
-    def _get_client_certificate_from_peer(self) -> tuple[str, str] | None:
-        """Return the client certificate and key from peer app data.
-
-        Returns:
-            A tuple of (certificate_pem, key_pem), or None if not yet available.
-        """
-        relation = self._peer_relation
-        if relation is None:
-            return None
-
-        secret_id = relation.data[self.model.app].get(SECRET_FIELD)
-        if not secret_id:
-            return None
-
-        secret = self.model.get_secret(id=secret_id)
-        content = secret.get_content(refresh=True)
-
-        return content["cert"], content["key"]
-
-    def _sync_client_certificate(self) -> bool:
-        """Persist the shared client certificate locally on this unit.
-
-        Returns:
-            True if the shared certificate was available and written locally,
-            otherwise False.
-        """
-        shared = self._get_client_certificate_from_peer()
-        if shared is None:
-            logger.debug("Shared rollingops client certificate is not available yet")
-            return False
-
-        cert_pem, key_pem = shared
-        if CertificatesManager.has_client_cert_and_key(cert_pem, key_pem):
-            return True
-
-        CertificatesManager.persist_client_cert_and_key(cert_pem, key_pem)
-        return True
 
     def _on_rollingop_granted(self, event: RollingOpsLockGrantedEvent) -> None:
         if not self._peer_relation or not self._etcd_relation:
@@ -722,7 +809,7 @@ class EtcdRollingOpsManager(Object):
         value = proc.stdout.strip()
         if value != self.keys.owner:
             logger.info("Callback not executed.")
-    
+
         callback = self.callback_targets.get("_restart", "")
         callback(delay=1)
 
@@ -782,7 +869,7 @@ class EtcdRollingOpsAsyncWorker(Object):
                 new_env["PYTHONPATH"] = f"{venv_path.resolve()}:{new_env['PYTHONPATH']}"
                 break
 
-        worker = self._charm_dir / "lib/charms/rolling_ops/v3" / "rollingops.py"
+        worker = self._charm_dir / "lib/charms/rolling_ops/v1" / "rollingops.py"
 
         pid = subprocess.Popen(
             [
@@ -854,125 +941,5 @@ def main():
     res.check_returncode()
 
 
-class EtcdRequiresV1(Object):
-    """EtcdRequires implementation for data interfaces version 1."""
-
-    def __init__(
-        self,
-        charm,
-        relation_name: str,
-        cluster_id: str,
-    ) -> None:
-        super().__init__(charm, "requirer-etcd")
-        self.charm = charm
-        self.peer_relation_name = "restart"
-        self.cluster_id = cluster_id
-        self.etcd_interface = ResourceRequirerEventHandler(
-            self.charm,
-            relation_name=relation_name,
-            requests=self.client_requests(),
-            response_model=ResourceProviderModel,
-        )
-
-        self.framework.observe(
-            self.etcd_interface.on.endpoints_changed, self._on_endpoints_changed
-        )
-        self.framework.observe(self.etcd_interface.on.resource_created, self._on_resource_created)
-
-    @property
-    def _peer_relation(self) -> Relation | None:
-        return self.charm.model.get_relation(self.peer_relation_name)
-    
-    def _on_endpoints_changed(
-        self, event: ResourceEndpointsChangedEvent[ResourceProviderModel]
-    ) -> None:
-        """Handle etcd client relation data changed event."""
-        response = event.response
-        logger.info("etcd endpoints changed: %s", response.endpoints)
-        if not response.endpoints:
-            logger.error("No etcd endpoints available")
-        
-        self._sync_client_certificate()
-        EtcdCtl.write_env_file(endpoints=response.endpoints)
-
-    def _on_resource_created(self, event: ResourceCreatedEvent[ResourceProviderModel]) -> None:
-        """Handle resource created event."""
-        response = event.response
-        if not response.tls_ca:
-            logger.error("No etcd server CA chain available")
-            return
-        if not response.username:
-            logger.error("No etcd username available")
-            return
-        
-        if not response.endpoints:
-            logger.error("No etcd endpoints available")
-
-        else:
-            EtcdCtl.write_env_file(endpoints=response.endpoints)
-        
-        self._sync_client_certificate()
-        EtcdCtl.write_server_ca(tls_ca_pem=response.tls_ca)
-        
-
-
-    def etcd_relation(self) -> Relation | None:
-        """Return the etcd relation if present."""
-        if not hasattr(self, "etcd_interface"):
-            return None
-        return self.etcd_interface.relations[0] if len(self.etcd_interface.relations) else None
-
-    def client_requests(self) -> list:
-        """Return the client requests for the etcd requirer interface."""
-        shared = self._get_client_certificate_from_peer()
-        if shared is None:
-            client_cert = ""
-        else:
-            client_cert, _ = shared
-        return [
-            RequirerCommonModel(
-                resource=f"{self.cluster_id}",
-                mtls_cert=client_cert or "",
-            )
-        ]
-    
-    def _get_client_certificate_from_peer(self) -> tuple[str, str] | None:
-        """Return the client certificate and key from peer app data.
-
-        Returns:
-            A tuple of (certificate_pem, key_pem), or None if not yet available.
-        """
-        relation = self._peer_relation
-        if relation is None:
-            return None
-
-        secret_id = relation.data[self.charm.model.app].get(SECRET_FIELD)
-        if not secret_id:
-            return None
-
-        secret = self.charm.model.get_secret(id=secret_id)
-        content = secret.get_content(refresh=True)
-
-        return content["cert"], content["key"]
-    
-    def _sync_client_certificate(self) -> bool:
-        """Persist the shared client certificate locally on this unit.
-
-        Returns:
-            True if the shared certificate was available and written locally,
-            otherwise False.
-        """
-        shared = self._get_client_certificate_from_peer()
-        if shared is None:
-            logger.debug("Shared rollingops client certificate is not available yet")
-            return False
-
-        cert_pem, key_pem = shared
-        if CertificatesManager.has_client_cert_and_key(cert_pem, key_pem):
-            return True
-
-        CertificatesManager.persist_client_cert_and_key(cert_pem, key_pem)
-        return True
-    
 if __name__ == "__main__":
     main()

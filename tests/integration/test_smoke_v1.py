@@ -16,8 +16,6 @@
 
 import json
 import logging
-import shutil
-import time
 from datetime import datetime
 
 import pytest
@@ -71,8 +69,9 @@ async def test_restart_action_one_unit(ops_test: OpsTest):
     await ops_test.model.deploy("charmed-etcd", application_name="etcd", channel="3.6/stable")
 
     await ops_test.model.integrate("etcd:client-certificates","self-signed-certificates:certificates")
-    await ops_test.model.integrate("rollingops:etcd","etcd:etcd-client")
+    await ops_test.model.wait_for_idle(status="active")
 
+    await ops_test.model.integrate("rollingops:etcd","etcd:etcd-client")
     await ops_test.model.wait_for_idle(status="active")
 
     unit = ops_test.model.applications["rollingops"].units[0]
@@ -83,6 +82,7 @@ async def test_restart_action_one_unit(ops_test: OpsTest):
 
     events = await get_unit_events(unit)
     restart_events = [e["event"] for e in events]
+    logger.info(restart_events)
 
     expected = [
         "action:restart",
@@ -90,8 +90,37 @@ async def test_restart_action_one_unit(ops_test: OpsTest):
         "_restart:done",
     ]
 
-    for transition in expected:
-        assert transition in restart_events
+    assert expected == restart_events
+
+
+
+@pytest.mark.abort_on_fail
+async def test_all_units_can_connect_to_etcd(ops_test):
+
+    await ops_test.model.applications["rollingops"].add_unit(count=2)
+    await ops_test.model.wait_for_idle(status="active")
+
+    units = ops_test.model.applications["rollingops"].units
+
+    for unit in units:
+        rm = await unit.run(f"rm -f {TRACE_FILE}")
+        await rm.wait()
+
+    for unit in units:
+        await unit.run_action("restart", **{"delay": 2})
+
+    await ops_test.model.wait_for_idle(status="active", timeout=600)
+
+    expected = [
+        "action:restart",
+        "_restart:start",
+        "_restart:done",
+    ]
+
+    for unit in units:
+        events = await get_unit_events(unit)
+        restart_events = [e["event"] for e in events]
+        assert restart_events == expected
 
 
 
